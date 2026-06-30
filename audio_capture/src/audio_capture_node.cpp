@@ -20,9 +20,9 @@ namespace audio_capture
       AudioCaptureNode(const rclcpp::NodeOptions & options)
       : Node("audio_capture_node", options), updater_(this), _desired_rate(-1.0)
       {
-        gst_init(nullptr, nullptr);
+        gst_init(nullptr, nullptr); //gstreamer 초기화
 
-        _bitrate = 192;
+        _bitrate = 192; //192kbps
         std::string src_type;
         std::string dst_type;
         std::string device;
@@ -30,15 +30,16 @@ namespace audio_capture
         // Need to encoding or publish raw wave data
         rcl_interfaces::msg::ParameterDescriptor audio_format_param_desc;
         audio_format_param_desc.description = "Audio format to encode or publish (mp3 or wave)";
-        this->declare_parameter<std::string>("format", "mp3", audio_format_param_desc);
+        this->declare_parameter<std::string>("format", "wave", audio_format_param_desc);
         rcl_interfaces::msg::ParameterDescriptor sample_format_param_desc;
         sample_format_param_desc.description = "Sample format for raw wave data (e.g., S16LE)";
-        this->declare_parameter<std::string>("sample_format", "S16LE", sample_format_param_desc);
-
+        this->declare_parameter<std::string>("sample_format", "S32LE", sample_format_param_desc);
+        
         this->get_parameter("format", _format);
         this->get_parameter("sample_format", _sample_format);
+        // 포맷: wave, 샘플 포맷: S32LE
 
-        // The bitrate at which to encode the audio
+        // The bitrate at which to encode the audio (mp3사용할때만 사용)
         rcl_interfaces::msg::ParameterDescriptor bitrate_param_desc;
         bitrate_param_desc.description = "The bitrate at which to encode the audio";
         this->declare_parameter<int>("bitrate", 192, bitrate_param_desc);
@@ -47,13 +48,13 @@ namespace audio_capture
         // only available for raw data
         rcl_interfaces::msg::ParameterDescriptor nb_channels_param_desc;
         nb_channels_param_desc.description = "Number of audio channels (only for raw data)";
-        this->declare_parameter<int>("channels", 1, nb_channels_param_desc);
+        this->declare_parameter<int>("channels", 2, nb_channels_param_desc);
         rcl_interfaces::msg::ParameterDescriptor nb_bits_param_desc;
         nb_bits_param_desc.description = "Audio depth in bits (only for raw data)";
-        this->declare_parameter<int>("depth", 16, nb_bits_param_desc);
+        this->declare_parameter<int>("depth", 32, nb_bits_param_desc);
         rcl_interfaces::msg::ParameterDescriptor sample_rate_param_desc;
         sample_rate_param_desc.description = "Sample rate in Hz (only for raw data)";
-        this->declare_parameter<int>("sample_rate", 16000, sample_rate_param_desc);
+        this->declare_parameter<int>("sample_rate", 96000, sample_rate_param_desc);
         this->get_parameter("channels", _channels);
         this->get_parameter("depth", _depth);
         this->get_parameter("sample_rate", _sample_rate);
@@ -74,7 +75,7 @@ namespace audio_capture
         rcl_interfaces::msg::ParameterDescriptor device_param_desc;
         device_param_desc.description = "The device of the audio source (e.g., hw:0,0; "
                                  "default is the system default)";
-        this->declare_parameter<std::string>("device", "", device_param_desc);
+        this->declare_parameter<std::string>("device", "hw:1,0", device_param_desc);
         this->get_parameter("device", device);
 
         _pub = this->create_publisher<audio_common_msgs::msg::AudioData>("audio", 10);

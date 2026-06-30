@@ -31,27 +31,27 @@ def generate_launch_description():
     )
     _format_launch_arg = DeclareLaunchArgument(
         'format',
-        default_value='mp3'
+        default_value='wave'
     )
     _bitrate_launch_arg = DeclareLaunchArgument(
         'bitrate',
-        default_value='128'
+        default_value='192'
     )
     _channels_launch_arg = DeclareLaunchArgument(
         'channels',
-        default_value='1'
+        default_value='2'
     )
     _depth_launch_arg = DeclareLaunchArgument(
         'depth',
-        default_value='16'
+        default_value='32'
     )
     _sample_rate_launch_arg = DeclareLaunchArgument(
         'sample_rate',
-        default_value='16000'
+        default_value='96000'
     )
     _sample_format_launch_arg = DeclareLaunchArgument(
         'sample_format',
-        default_value='S16LE'
+        default_value='S32LE'
     )
     _ns_launch_arg = DeclareLaunchArgument(
         'ns',
