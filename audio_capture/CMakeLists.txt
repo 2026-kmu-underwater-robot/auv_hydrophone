@@ -5,6 +5,9 @@ project(audio_capture)
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_components REQUIRED)
+find_package(std_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
 find_package(audio_common_msgs REQUIRED)
 find_package(diagnostic_updater REQUIRED)
 find_package(Eigen3 REQUIRED)
@@ -17,6 +20,8 @@ find_package(Boost REQUIRED COMPONENTS thread)
 add_library(${PROJECT_NAME} SHARED
   src/audio_capture_node.cpp
   src/audio_frequency_detector.cpp
+  src/audio_phase_estimator.cpp
+  src/fft_node.cpp
 )
 
 # 3. 단축키(ament_target_dependencies) 대신 수동으로 헤더 파일 경로를 지정합니다.
@@ -24,6 +29,9 @@ target_include_directories(${PROJECT_NAME}
   PRIVATE
     ${rclcpp_INCLUDE_DIRS}
     ${rclcpp_components_INCLUDE_DIRS}
+    ${std_msgs_INCLUDE_DIRS}
+    ${geometry_msgs_INCLUDE_DIRS}
+    ${nav_msgs_INCLUDE_DIRS}
     ${audio_common_msgs_INCLUDE_DIRS}
     ${diagnostic_updater_INCLUDE_DIRS}
     ${EIGEN3_INCLUDE_DIRS}
@@ -37,6 +45,9 @@ target_link_libraries(${PROJECT_NAME}
   PUBLIC
     ${rclcpp_LIBRARIES}
     ${rclcpp_components_LIBRARIES}
+    ${std_msgs_LIBRARIES}
+    ${geometry_msgs_LIBRARIES}
+    ${nav_msgs_LIBRARIES}
     ${audio_common_msgs_LIBRARIES}
     ${diagnostic_updater_LIBRARIES}
   PRIVATE
@@ -60,11 +71,25 @@ rclcpp_components_register_node(
   EXECUTABLE audio_frequency_detector
 )
 
+rclcpp_components_register_node(
+  ${PROJECT_NAME}
+  PLUGIN "audio_capture::AudioPhaseEstimatorNode"
+  EXECUTABLE audio_phase_estimator
+)
+
+rclcpp_components_register_node(
+  ${PROJECT_NAME}
+  PLUGIN "audio_capture::AudioFftNode"
+  EXECUTABLE fft_node
+)
+
 # 6. 생성된 컴포넌트 라이브러리와 단독 실행 파일을 모두 알맞은 폴더에 설치합니다.
 install(TARGETS 
   ${PROJECT_NAME} 
   audio_capture_node
   audio_frequency_detector
+  audio_phase_estimator
+  fft_node
   LIBRARY DESTINATION lib
   ARCHIVE DESTINATION lib
   RUNTIME DESTINATION lib/${PROJECT_NAME}

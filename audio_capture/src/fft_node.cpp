@@ -1,3 +1,6 @@
+//일반 FFT 분석 노드
+
+
 #include <cstdint>
 #include <algorithm>
 #include <cmath>
@@ -19,23 +22,23 @@
 
 namespace audio_capture
 {
-class AudioFrequencyDetectorNode : public rclcpp::Node
+class AudioFftNode : public rclcpp::Node
 {
     public:
-    explicit AudioFrequencyDetectorNode(const rclcpp::NodeOptions & options = rclcpp::NodeOptions()) 
-    : Node("audio_frequency_detector", options) {
+    explicit AudioFftNode(const rclcpp::NodeOptions & options = rclcpp::NodeOptions()) 
+    : Node("fft_node", options) {
         // /audio/audio 토픽에서 audio_common_msgs/msg/AudioData 메시지를 받는다.
         audio_sub_ = this->create_subscription<audio_common_msgs::msg::AudioData>(
         "/audio",
         rclcpp::QoS(10),
-        std::bind(&AudioFrequencyDetectorNode::audio_callback, this, std::placeholders::_1));
+        std::bind(&AudioFftNode::audio_callback, this, std::placeholders::_1));
         //std::placeholders::_1: 콜백에 들어갈 첫 번째 인자를 의미 
 
         // 분석 thread는 생성자 마지막에서 한 번만 시작한다.
-        worker_thread_ = std::thread(&AudioFrequencyDetectorNode::analysis_loop, this);
+        worker_thread_ = std::thread(&AudioFftNode::analysis_loop, this);
     }
 
-    ~AudioFrequencyDetectorNode()//소멸자
+    ~AudioFftNode()//소멸자
     {
         {
             std::lock_guard<std::mutex> lock(buffer_mutex_);    //뮤텍스락을 잡고
@@ -103,10 +106,10 @@ class AudioFrequencyDetectorNode : public rclcpp::Node
         std::vector<std::complex<double>> frequency_bins;   //FFT 결과를 저장할 벡터
         fft_.fwd(frequency_bins, windowed_samples);   //FFT 계산
 
-        const double frequency_resolution_hz =  //주파수 해상도: 96000 / 4096 = 23.4375 Hz
-            static_cast<double>(sampling_rate_) / static_cast<double>(window.size()); 
+        const double frequency_resolution_hz =
+            static_cast<double>(sampling_rate_) / static_cast<double>(window.size()); //주파수 해상도: 96000 / 4096 = 23.4375 Hz
 
-        // 입력이 실수 신호라서 Nyquist까지만.
+        // 입력이 실수 신호라서 Nyquist까지만 보면 된다.
         const std::size_t nyquist_bin = frequency_bins.size() / 2;   //2048
         const std::size_t min_bin = std::max<std::size_t>(   //10000 / 23.4375 = 426.6666666666667 -> 427
             1,
@@ -116,45 +119,26 @@ class AudioFrequencyDetectorNode : public rclcpp::Node
             static_cast<std::size_t>(std::floor(max_detection_frequency_hz_ / frequency_resolution_hz)));
 
         std::size_t peak_bin = min_bin;
-        double peak_target_frequency_hz = 0.0;
         double peak_magnitude = 0.0;
         // 10k~30k Hz 범위의 bin에 해당하는 진폭을 저장할 벡터
         std::vector<double> band_magnitudes;
         band_magnitudes.reserve(max_bin - min_bin + 1);   // 427~1280까지의 개수: 854개 미리 메모리 할당
 
-
-        // min_bin부터 max_bin까지 반복하면서 핑거 후보 주파수 주변의 가장 큰 진폭을 가진 bin을 찾는다.
+        // min_bin부터 max_bin까지 반복하면서 가장 큰 진폭을 가진 bin을 찾는다.
         for (std::size_t bin = min_bin; bin <= max_bin; ++bin) {
-            const double frequency_hz = static_cast<double>(bin) * frequency_resolution_hz; //bin을 주파수로 변환
+            const double frequency_hz = static_cast<double>(bin) * frequency_resolution_hz;
             const double magnitude = std::abs(frequency_bins[bin]); //해당 bin의 진폭
             band_magnitudes.push_back(magnitude); //벡터에 추가
 
-            if (std::abs(frequency_hz - blacklist_frequency_hz_) <= blacklist_half_width_hz_) { //blacklist 주파수 주변에 있으면 건너뜀
+            if (std::abs(frequency_hz - blacklist_frequency_hz_) <= blacklist_half_width_hz_) {
                 continue;
             }
 
-            double matched_target_frequency_hz = 0.0;
-            bool is_candidate_frequency = false;
-            for (const double target_frequency_hz : target_frequencies_hz_) {   //target_frequencies_hz_ 벡터에 있는 주파수 하나씩 반복
-                if (std::abs(frequency_hz - target_frequency_hz) <= target_search_half_width_hz_) { //주파수 오차가 1kHz 이하이면 탐지 가능한 주파수로 판정
-                    matched_target_frequency_hz = target_frequency_hz;
-                    is_candidate_frequency = true;
-                    break;
-                }
-            }
-
-            if (!is_candidate_frequency) {  //탐지 가능한 주파수가 아니면 건너뜀
-                continue;
-            }
-
-            if (magnitude > peak_magnitude) {   //현재 bin의 진폭이 이전 bin의 진폭보다 크면 피크 진폭과 피크 주파수 업데이트
+            if (magnitude > peak_magnitude) {
                 peak_magnitude = magnitude;
                 peak_bin = bin;
-                peak_target_frequency_hz = matched_target_frequency_hz;
             }
-        }  
-        
-        
+        }   
         // peak_bin을 주파수로 변환
         const double peak_frequency_hz = static_cast<double>(peak_bin) * frequency_resolution_hz;
         // 노이즈 플로어 계산: 벡터에서 중간값을 계산하여 노이즈 플로어를 추정
@@ -170,8 +154,9 @@ class AudioFrequencyDetectorNode : public rclcpp::Node
             this->get_logger(),
             *this->get_clock(),
             1000,
-            "target %.0f Hz peak: %.1f Hz, mag: %.6f, noise: %.6f, snr: %.1f dB, lock: %s%s",
-            peak_target_frequency_hz,
+            "band %.0f-%.0f Hz peak: %.1f Hz, mag: %.6f, noise: %.6f, snr: %.1f dB, lock: %s%s",
+            min_detection_frequency_hz_,
+            max_detection_frequency_hz_,
             peak_frequency_hz,
             peak_magnitude,
             noise_floor,
@@ -282,12 +267,10 @@ class AudioFrequencyDetectorNode : public rclcpp::Node
     
 
     std::size_t sampling_rate_ = 96000;//샘플링 주파수
-    double min_detection_frequency_hz_ = 10000.0;
+    double min_detection_frequency_hz_ = 18000.0;
     double max_detection_frequency_hz_ = 30000.0;
-    std::vector<double> target_frequencies_hz_ = {21164.0, 27211.0};    //bin: 903, 1161정도.
-    double target_search_half_width_hz_ = 1000.0;
     double blacklist_frequency_hz_ = 23900.0;
-    double blacklist_half_width_hz_ = 500.0;
+    double blacklist_half_width_hz_ = 1000.0;
 
     //SNR 계산 관련 파라미터
     double min_snr_db_ = 10.0;  // threshold SNR: 10dB
@@ -307,4 +290,4 @@ class AudioFrequencyDetectorNode : public rclcpp::Node
 
 
 // namespace audio_capture
-RCLCPP_COMPONENTS_REGISTER_NODE(audio_capture::AudioFrequencyDetectorNode)
+RCLCPP_COMPONENTS_REGISTER_NODE(audio_capture::AudioFftNode)

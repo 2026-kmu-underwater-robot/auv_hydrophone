@@ -24,8 +24,11 @@
    <build_depend>boost</build_depend>
    <build_depend>diagnostic_updater</build_depend>
    <build_depend>eigen</build_depend>
+   <build_depend>geometry_msgs</build_depend>
+   <build_depend>nav_msgs</build_depend>
    <build_depend>rclcpp</build_depend>
    <build_depend>rclcpp_components</build_depend>
+   <build_depend>std_msgs</build_depend>
 
    <build_depend>libgstreamer1.0-dev</build_depend>
    <build_depend>libgstreamer-plugins-base1.0-dev</build_depend>
@@ -33,8 +36,11 @@
    <exec_depend>audio_common_msgs</exec_depend>
    <exec_depend>diagnostic_updater</exec_depend>
    <exec_depend>launch_xml</exec_depend>
+   <exec_depend>geometry_msgs</exec_depend>
+   <exec_depend>nav_msgs</exec_depend>
    <exec_depend>rclcpp</exec_depend>
    <exec_depend>rclcpp_components</exec_depend>
+   <exec_depend>std_msgs</exec_depend>
 
    <exec_depend>gstreamer1.0</exec_depend>
    <exec_depend>gstreamer1.0-alsa</exec_depend>

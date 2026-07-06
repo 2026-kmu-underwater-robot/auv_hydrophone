@@ -1,5 +1,4 @@
-//일반 FFT 분석 노드
-
+//타겟 주파수 탐지 알고리즘
 
 #include <cstdint>
 #include <algorithm>
@@ -17,6 +16,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <audio_common_msgs/msg/audio_data.hpp>
 #include <rclcpp_components/register_node_macro.hpp>
+#include <std_msgs/msg/float64.hpp>
 #include <unsupported/Eigen/FFT>
 
 
@@ -33,6 +33,7 @@ class AudioFrequencyDetectorNode : public rclcpp::Node
         rclcpp::QoS(10),
         std::bind(&AudioFrequencyDetectorNode::audio_callback, this, std::placeholders::_1));
         //std::placeholders::_1: 콜백에 들어갈 첫 번째 인자를 의미 
+        locked_frequency_pub_ = this->create_publisher<std_msgs::msg::Float64>("/audio/locked_frequency_hz", 10);
 
         // 분석 thread는 생성자 마지막에서 한 번만 시작한다.
         worker_thread_ = std::thread(&AudioFrequencyDetectorNode::analysis_loop, this);
@@ -94,54 +95,83 @@ class AudioFrequencyDetectorNode : public rclcpp::Node
 
     //FFT 분석 함수
     void analyze_window(const std::vector<double> & window) {
-        std::vector<double> windowed_samples(window.size()); //윈도우 크기만큼 벡터 생성
+        std::vector<double> fft_input(fft_size_, 0.0); // window 뒤를 0으로 채워 FFT bin 간격을 촘촘하게 만든다.
         const double hann_denominator = static_cast<double>(window.size() - 1); // N-1
 
         // FFT 전에 Hann window를 곱해 window 경계에서 생기는 주파수 누설을 줄인다.
         for (std::size_t n = 0; n < window.size(); ++n) {
             const double hann = 0.5 * (1.0 - std::cos((2.0 * M_PI * static_cast<double>(n)) / hann_denominator));
-            windowed_samples[n] = window[n] * hann;
+            fft_input[n] = window[n] * hann;
         }
 
         std::vector<std::complex<double>> frequency_bins;   //FFT 결과를 저장할 벡터
-        fft_.fwd(frequency_bins, windowed_samples);   //FFT 계산
+        fft_.fwd(frequency_bins, fft_input);   //zero-padded FFT 계산
 
-        const double frequency_resolution_hz =
-            static_cast<double>(sampling_rate_) / static_cast<double>(window.size()); //주파수 해상도: 96000 / 4096 = 23.4375 Hz
+        const double frequency_resolution_hz =  //zero-padding 후 bin 간격: 96000 / 32768 = 2.9296875 Hz
+            static_cast<double>(sampling_rate_) / static_cast<double>(fft_input.size()); 
 
-        // 입력이 실수 신호라서 Nyquist까지만 보면 된다.
-        const std::size_t nyquist_bin = frequency_bins.size() / 2;   //2048
-        const std::size_t min_bin = std::max<std::size_t>(   //10000 / 23.4375 = 426.6666666666667 -> 427
+        // 입력이 실수 신호라서 Nyquist까지만.
+        const std::size_t nyquist_bin = frequency_bins.size() / 2;
+        const std::size_t min_bin = std::max<std::size_t>(
             1,
             static_cast<std::size_t>(std::ceil(min_detection_frequency_hz_ / frequency_resolution_hz)));
-        const std::size_t max_bin = std::min<std::size_t>(   //30000 / 23.4375 = 1280.0
+        const std::size_t max_bin = std::min<std::size_t>(
             nyquist_bin,
             static_cast<std::size_t>(std::floor(max_detection_frequency_hz_ / frequency_resolution_hz)));
 
         std::size_t peak_bin = min_bin;
+        double peak_target_frequency_hz = 0.0;
         double peak_magnitude = 0.0;
-        // 10k~30k Hz 범위의 bin에 해당하는 진폭을 저장할 벡터
-        std::vector<double> band_magnitudes;
-        band_magnitudes.reserve(max_bin - min_bin + 1);   // 427~1280까지의 개수: 854개 미리 메모리 할당
 
-        // min_bin부터 max_bin까지 반복하면서 가장 큰 진폭을 가진 bin을 찾는다.
+
+        // min_bin부터 max_bin까지 반복하면서 핑거 후보 주파수 주변의 가장 큰 진폭을 가진 bin을 찾는다.
         for (std::size_t bin = min_bin; bin <= max_bin; ++bin) {
+            const double frequency_hz = static_cast<double>(bin) * frequency_resolution_hz; //bin을 주파수로 변환
             const double magnitude = std::abs(frequency_bins[bin]); //해당 bin의 진폭
-            band_magnitudes.push_back(magnitude); //벡터에 추가
 
-            if (magnitude > peak_magnitude) {
+            if (std::abs(frequency_hz - blacklist_frequency_hz_) <= blacklist_half_width_hz_) { //blacklist 주파수 주변에 있으면 건너뜀
+                continue;
+            }
+
+            double matched_target_frequency_hz = 0.0;
+            bool is_candidate_frequency = false;
+            for (const double target_frequency_hz : target_frequencies_hz_) {   //target_frequencies_hz_ 벡터에 있는 주파수 하나씩 반복
+                if (std::abs(frequency_hz - target_frequency_hz) <= target_search_half_width_hz_) { //주파수 오차가 1kHz 이하이면 탐지 가능한 주파수로 판정
+                    matched_target_frequency_hz = target_frequency_hz;
+                    is_candidate_frequency = true;
+                    break;
+                }
+            }
+
+            if (!is_candidate_frequency) {  //탐지 가능한 주파수가 아니면 건너뜀
+                continue;
+            }
+
+            if (magnitude > peak_magnitude) {   //현재 bin의 진폭이 이전 bin의 진폭보다 크면 피크 진폭과 피크 주파수 업데이트
                 peak_magnitude = magnitude;
                 peak_bin = bin;
+                peak_target_frequency_hz = matched_target_frequency_hz;
             }
-        }   
+        }  
+        
         // peak_bin을 주파수로 변환
         const double peak_frequency_hz = static_cast<double>(peak_bin) * frequency_resolution_hz;
-        // 노이즈 플로어 계산: 벡터에서 중간값을 계산하여 노이즈 플로어를 추정
-        const double noise_floor = calculate_median(band_magnitudes);
+        const double noise_floor = calculate_local_noise_floor(
+            frequency_bins,
+            peak_bin,
+            min_bin,
+            max_bin,
+            frequency_resolution_hz);
         const double snr_db = 20.0 * std::log10((peak_magnitude + epsilon_) / (noise_floor + epsilon_));   //SNR 계산
         const bool snr_detected = snr_db >= min_snr_db_; //SNR이 최소 SNR 이상이면 true, 아니면 false
 
         update_lock_state(snr_detected, peak_frequency_hz); 
+        if (locked_on_) {
+            std_msgs::msg::Float64 frequency_msg;
+            frequency_msg.data = locked_frequency_hz_;
+            locked_frequency_pub_->publish(frequency_msg);
+        }
+
         const std::string lock_detail =
             locked_on_ ? ", locked_freq: " + std::to_string(locked_frequency_hz_) + " Hz" : "";
 
@@ -149,9 +179,8 @@ class AudioFrequencyDetectorNode : public rclcpp::Node
             this->get_logger(),
             *this->get_clock(),
             1000,
-            "band %.0f-%.0f Hz peak: %.1f Hz, mag: %.6f, noise: %.6f, snr: %.1f dB, lock: %s%s",
-            min_detection_frequency_hz_,
-            max_detection_frequency_hz_,
+            "target %.0f Hz peak: %.1f Hz, mag: %.6f, noise: %.6f, snr: %.1f dB, lock: %s%s",
+            peak_target_frequency_hz,
             peak_frequency_hz,
             peak_magnitude,
             noise_floor,
@@ -168,6 +197,41 @@ class AudioFrequencyDetectorNode : public rclcpp::Node
         const std::size_t middle = values.size() / 2;
         std::nth_element(values.begin(), values.begin() + middle, values.end());
         return values[middle];
+    }
+
+    double calculate_local_noise_floor(
+        const std::vector<std::complex<double>> & frequency_bins,
+        const std::size_t peak_bin,
+        const std::size_t min_bin,
+        const std::size_t max_bin,
+        const double frequency_resolution_hz) const
+    {
+        std::vector<double> noise_magnitudes;
+        const std::size_t offset_min =
+            static_cast<std::size_t>(std::ceil(noise_guard_half_width_hz_ / frequency_resolution_hz));
+        const std::size_t offset_max =
+            static_cast<std::size_t>(std::floor(noise_floor_half_width_hz_ / frequency_resolution_hz));
+        noise_magnitudes.reserve((offset_max - offset_min + 1) * 2);
+
+        for (std::size_t offset = offset_min; offset <= offset_max; ++offset) {
+            if (peak_bin >= min_bin + offset) {
+                const std::size_t left_bin = peak_bin - offset;
+                const double left_frequency_hz = static_cast<double>(left_bin) * frequency_resolution_hz;
+                if (std::abs(left_frequency_hz - blacklist_frequency_hz_) > blacklist_half_width_hz_) {
+                    noise_magnitudes.push_back(std::abs(frequency_bins[left_bin]));
+                }
+            }
+
+            if (peak_bin + offset <= max_bin) {
+                const std::size_t right_bin = peak_bin + offset;
+                const double right_frequency_hz = static_cast<double>(right_bin) * frequency_resolution_hz;
+                if (std::abs(right_frequency_hz - blacklist_frequency_hz_) > blacklist_half_width_hz_) {
+                    noise_magnitudes.push_back(std::abs(frequency_bins[right_bin]));
+                }
+            }
+        }
+
+        return calculate_median(noise_magnitudes);
     }
 
     void update_lock_state(const bool snr_detected, const double peak_frequency_hz)
@@ -189,21 +253,26 @@ class AudioFrequencyDetectorNode : public rclcpp::Node
             return;
         }
 
-        const double reference_frequency_hz = candidate_frequencies_hz_.front();   // 판정할 주파수 후보들의 첫 번째 주파수
+        // 7개 후보 중 5개 이상이 lock_tolerance_hz_ 안에 몰리면 같은 핑거 주파수로 판단한다.
+        double mode_frequency_hz = candidate_frequencies_hz_.front();   // 가장 많이 몰린 후보 그룹의 대표 피크 주파수
+        std::size_t mode_count = 0;
         for (const double candidate_frequency_hz : candidate_frequencies_hz_) {
-            if (std::abs(candidate_frequency_hz - reference_frequency_hz) > lock_tolerance_hz_) {   // 판정할 주파수 후보들의 주파수와 참조 주파수의 차이가 오차 허용 범위를 초과하면 주파수 판정 결과를 false로 설정
-                locked_on_ = false;
-                return;
+            std::size_t candidate_count = 0;
+            for (const double other_frequency_hz : candidate_frequencies_hz_) {
+                if (std::abs(other_frequency_hz - candidate_frequency_hz) <= lock_tolerance_hz_) {
+                    ++candidate_count;
+                }
+            }
+            if (candidate_count > mode_count) {
+                mode_count = candidate_count;
+                mode_frequency_hz = candidate_frequency_hz;
             }
         }
-
-        double frequency_sum_hz = 0.0;
-        for (const double candidate_frequency_hz : candidate_frequencies_hz_) {   // 판정할 주파수 후보들의 주파수를 모두 더해서 평균값을 계산
-            frequency_sum_hz += candidate_frequency_hz;
+        if (mode_count < min_lock_count_) {
+            locked_on_ = false;
+            return;
         }
-
-        locked_frequency_hz_ =   // 판정할 주파수 후보들의 평균값을 lock-on된 주파수로 설정
-            frequency_sum_hz / static_cast<double>(candidate_frequencies_hz_.size());
+        locked_frequency_hz_ = mode_frequency_hz;   // 판정할 주파수 후보들의 최빈값을 lock-on된 주파수로 설정
         locked_on_ = true;   // 주파수 판정 결과를 true로 설정
     }
 
@@ -241,6 +310,7 @@ class AudioFrequencyDetectorNode : public rclcpp::Node
 
     // 오디오 데이터 구독자
     rclcpp::Subscription<audio_common_msgs::msg::AudioData>::SharedPtr audio_sub_;
+    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr locked_frequency_pub_;
 
     // 변환된 단일 채널 오디오 샘플을 계속 누적하는 버퍼
     std::vector<double> sample_buffer_;
@@ -259,18 +329,26 @@ class AudioFrequencyDetectorNode : public rclcpp::Node
     //FFT할 때 사용할 윈도우 크기와 홉 크기
     std::size_t window_size_ = 4096;
     std::size_t hop_size_ = 2048;
+    std::size_t fft_size_ = 32768; // 4096 샘플 뒤를 zero-padding해서 FFT peak 주파수를 더 촘촘하게 고른다.
     
 
     std::size_t sampling_rate_ = 96000;//샘플링 주파수
     double min_detection_frequency_hz_ = 10000.0;
     double max_detection_frequency_hz_ = 30000.0;
+    std::vector<double> target_frequencies_hz_ = {21164.0, 27211.0};
+    double target_search_half_width_hz_ = 100.0;
+    double blacklist_frequency_hz_ = 23900.0;
+    double blacklist_half_width_hz_ = 500.0;
 
     //SNR 계산 관련 파라미터
     double min_snr_db_ = 10.0;  // threshold SNR: 10dB
-    double lock_tolerance_hz_ = 300.0;  // 판정할 주파수 후보들 간의 오차 허용 범위: 300Hz
-    std::size_t lock_window_count_ = 4;  // 판정할 주파수 후보들의 개수: 4개
+    double noise_floor_half_width_hz_ = 1000.0;  // peak 주변 local noise를 볼 범위
+    double noise_guard_half_width_hz_ = 200.0;  // peak와 누설 성분은 noise 계산에서 제외
+    double lock_tolerance_hz_ = 50.0;  // 판정할 주파수 후보들 간의 오차 허용 범위: 20Hz
+    std::size_t lock_window_count_ = 7;  // 판정할 주파수 후보들의 개수: 7개
+    std::size_t min_lock_count_ = 5;  // 7개 후보 중 5개 이상이 같은 대역에 몰리면 lock-on
     bool locked_on_ = false;  // 주파수 판정 결과: true/false    
-    double locked_frequency_hz_ = 0.0;  // lock-on된 주파수: 판정할 주파수 후보들의 평균값
+    double locked_frequency_hz_ = 0.0;  // lock-on된 주파수: 판정할 주파수 후보들의 최빈값
     std::deque<double> candidate_frequencies_hz_;   // 판정할 주파수 후보들을 저장할 큐
     double epsilon_ = 1.0e-12;  // SNR 계산할 때 0으로 나누는 걸 막기 위한 아주 작은 값
 
