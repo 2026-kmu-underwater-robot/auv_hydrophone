@@ -8,6 +8,7 @@ find_package(rclcpp_components REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(mavros_msgs REQUIRED)
 find_package(audio_common_msgs REQUIRED)
 find_package(diagnostic_updater REQUIRED)
 find_package(Eigen3 REQUIRED)
@@ -21,6 +22,7 @@ add_library(${PROJECT_NAME} SHARED
   src/audio_capture_node.cpp
   src/audio_frequency_detector.cpp
   src/audio_phase_estimator.cpp
+  src/homing_controller_node.cpp
   src/fft_node.cpp
 )
 
@@ -32,6 +34,7 @@ target_include_directories(${PROJECT_NAME}
     ${std_msgs_INCLUDE_DIRS}
     ${geometry_msgs_INCLUDE_DIRS}
     ${nav_msgs_INCLUDE_DIRS}
+    ${mavros_msgs_INCLUDE_DIRS}
     ${audio_common_msgs_INCLUDE_DIRS}
     ${diagnostic_updater_INCLUDE_DIRS}
     ${EIGEN3_INCLUDE_DIRS}
@@ -48,6 +51,7 @@ target_link_libraries(${PROJECT_NAME}
     ${std_msgs_LIBRARIES}
     ${geometry_msgs_LIBRARIES}
     ${nav_msgs_LIBRARIES}
+    ${mavros_msgs_LIBRARIES}
     ${audio_common_msgs_LIBRARIES}
     ${diagnostic_updater_LIBRARIES}
   PRIVATE
@@ -79,6 +83,12 @@ rclcpp_components_register_node(
 
 rclcpp_components_register_node(
   ${PROJECT_NAME}
+  PLUGIN "audio_capture::HomingControllerNode"
+  EXECUTABLE homing_controller
+)
+
+rclcpp_components_register_node(
+  ${PROJECT_NAME}
   PLUGIN "audio_capture::AudioFftNode"
   EXECUTABLE fft_node
 )
@@ -89,6 +99,7 @@ install(TARGETS
   audio_capture_node
   audio_frequency_detector
   audio_phase_estimator
+  homing_controller
   fft_node
   LIBRARY DESTINATION lib
   ARCHIVE DESTINATION lib
