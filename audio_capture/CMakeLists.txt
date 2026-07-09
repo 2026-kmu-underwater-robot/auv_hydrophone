@@ -23,6 +23,7 @@ add_library(${PROJECT_NAME} SHARED
   src/audio_frequency_detector.cpp
   src/audio_phase_estimator.cpp
   src/homing_controller_node.cpp
+  src/simple_homing_controller_node.cpp
   src/fft_node.cpp
 )
 
@@ -89,6 +90,12 @@ rclcpp_components_register_node(
 
 rclcpp_components_register_node(
   ${PROJECT_NAME}
+  PLUGIN "audio_capture::SimpleHomingControllerNode"
+  EXECUTABLE simple_homing_controller
+)
+
+rclcpp_components_register_node(
+  ${PROJECT_NAME}
   PLUGIN "audio_capture::AudioFftNode"
   EXECUTABLE fft_node
 )
@@ -100,6 +107,7 @@ install(TARGETS
   audio_frequency_detector
   audio_phase_estimator
   homing_controller
+  simple_homing_controller
   fft_node
   LIBRARY DESTINATION lib
   ARCHIVE DESTINATION lib

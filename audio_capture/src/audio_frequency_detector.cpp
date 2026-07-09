@@ -29,7 +29,7 @@ class AudioFrequencyDetectorNode : public rclcpp::Node
     : Node("audio_frequency_detector", options) {
         // /audio/audio 토픽에서 audio_common_msgs/msg/AudioData 메시지를 받는다.
         audio_sub_ = this->create_subscription<audio_common_msgs::msg::AudioData>(
-        "/audio",
+        "/audio_boosted",
         rclcpp::QoS(10),
         std::bind(&AudioFrequencyDetectorNode::audio_callback, this, std::placeholders::_1));
         //std::placeholders::_1: 콜백에 들어갈 첫 번째 인자를 의미 
