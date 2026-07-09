@@ -1,649 +1,416 @@
-#include <cstdint>
-
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
-#include <complex>
-#include <deque>
 #include <memory>
-#include <vector>
-
-#include <condition_variable>
-#include <mutex>
+#include <string>
 #include <thread>
 
-#include <audio_common_msgs/msg/audio_data.hpp>
+#include <sys/select.h>
+#include <termios.h>
+#include <unistd.h>
+
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <geometry_msgs/msg/vector3_stamped.hpp>
+#include <mavros_msgs/msg/override_rc_in.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_components/register_node_macro.hpp>
-#include <std_msgs/msg/float64.hpp>
-#include <Eigen/Dense>
 
 namespace audio_capture
 {
-class AudioPhaseEstimatorNode : public rclcpp::Node
+class HomingControllerNode : public rclcpp::Node
 {
 public:
-    explicit AudioPhaseEstimatorNode(const rclcpp::NodeOptions & options = rclcpp::NodeOptions())
-    : Node("audio_phase_estimator", options)
+    explicit HomingControllerNode(const rclcpp::NodeOptions & options = rclcpp::NodeOptions())
+    : Node("homing_controller", options)
     {
-        audio_sub_ = this->create_subscription<audio_common_msgs::msg::AudioData>(
-            "/audio",
+        direction_sub_ = this->create_subscription<geometry_msgs::msg::Vector3Stamped>(
+            "/homing/direction",
             10,
-            std::bind(&AudioPhaseEstimatorNode::audio_callback, this, std::placeholders::_1));
-        dvl_odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+            std::bind(&HomingControllerNode::direction_callback, this, std::placeholders::_1));
+        odometry_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
             "/odometry/filtered",
             10,
-            std::bind(&AudioPhaseEstimatorNode::dvl_odometry_callback, this, std::placeholders::_1));
-        depth_pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
+            std::bind(&HomingControllerNode::odometry_callback, this, std::placeholders::_1));
+        depth_sub_ = this->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
             "/depth/pose",
             10,
-            std::bind(&AudioPhaseEstimatorNode::depth_pose_callback, this, std::placeholders::_1));
-        homing_direction_pub_ =
-            this->create_publisher<geometry_msgs::msg::Vector3Stamped>("/homing/direction", 10);
-        delta_phase_pub_ =
-            this->create_publisher<std_msgs::msg::Float64>("/audio_phase_estimator/delta_phase_rad", 10);
-        delta_range_pub_ =
-            this->create_publisher<std_msgs::msg::Float64>("/audio_phase_estimator/delta_range_m", 10);
-        iq_magnitude_pub_ =
-            this->create_publisher<std_msgs::msg::Float64>("/audio_phase_estimator/iq_magnitude", 10);
-        observed_frequency_offset_pub_ =
-            this->create_publisher<std_msgs::msg::Float64>("/audio_phase_estimator/observed_frequency_offset_hz", 10);
-        demodulation_frequency_pub_ =
-            this->create_publisher<std_msgs::msg::Float64>("/audio_phase_estimator/demodulation_frequency_hz", 10);
-        homing_bias_range_rate_pub_ =
-            this->create_publisher<std_msgs::msg::Float64>("/audio_phase_estimator/homing_bias_range_rate_mps", 10);
-        homing_bias_frequency_pub_ =
-            this->create_publisher<std_msgs::msg::Float64>("/audio_phase_estimator/homing_bias_frequency_hz", 10);
-        reference_frequency_hz_ =
-            this->declare_parameter<double>("reference_frequency_hz", reference_frequency_hz_);
-        demodulation_frequency_hz_ = this->declare_parameter<double>(
-            "initial_demodulation_frequency_hz",
-            reference_frequency_hz_);
-        sound_speed_mps_ = this->declare_parameter<double>("sound_speed_mps", sound_speed_mps_);
-        sync_delay_s_ = this->declare_parameter<double>("sync_delay_s", 0.10);
-        min_iq_magnitude_ = this->declare_parameter<double>("min_iq_magnitude", 1.0e-5);
-        direction_filter_alpha_ = this->declare_parameter<double>("direction_filter_alpha", 0.12);
-        enable_frequency_acquisition_ =
-            this->declare_parameter<bool>("enable_frequency_acquisition", enable_frequency_acquisition_);
-        frequency_search_half_width_hz_ = this->declare_parameter<double>(
-            "frequency_search_half_width_hz",
-            frequency_search_half_width_hz_);
-        frequency_search_step_hz_ = this->declare_parameter<double>(
-            "frequency_search_step_hz",
-            frequency_search_step_hz_);
-        frequency_reacquire_threshold_hz_ = this->declare_parameter<double>(
-            "frequency_reacquire_threshold_hz",
-            frequency_reacquire_threshold_hz_);
+            std::bind(&HomingControllerNode::depth_callback, this, std::placeholders::_1));
 
-        worker_thread_ = std::thread(&AudioPhaseEstimatorNode::analysis_loop, this);
+        rc_pub_ = this->create_publisher<mavros_msgs::msg::OverrideRCIn>("/mavros/rc/override", 10);
+
+        homing_enabled_.store(this->declare_parameter<bool>("homing_enabled", true));
+        control_rate_hz_ = this->declare_parameter<double>("control_rate_hz", 20.0);
+        direction_timeout_s_ = this->declare_parameter<double>("direction_timeout_s", 1.0);
+        pwm_slew_rate_per_s_ = this->declare_parameter<double>("pwm_slew_rate_per_s", 300.0);
+        publish_neutral_when_inactive_ =
+            this->declare_parameter<bool>("publish_neutral_when_inactive", true);
+
+        yaw_kp_ = this->declare_parameter<double>("yaw_kp", 180.0);
+        yaw_ki_ = this->declare_parameter<double>("yaw_ki", 0.0);
+        yaw_kd_ = this->declare_parameter<double>("yaw_kd", 20.0);
+        yaw_pwm_limit_ = this->declare_parameter<double>("yaw_pwm_limit", 180.0);
+
+        depth_kp_ = this->declare_parameter<double>("depth_kp", 180.0);
+        depth_ki_ = this->declare_parameter<double>("depth_ki", 0.0);
+        depth_kd_ = this->declare_parameter<double>("depth_kd", 30.0);
+        depth_pwm_limit_ = this->declare_parameter<double>("depth_pwm_limit", 180.0);
+        depth_ref_rate_mps_ = this->declare_parameter<double>("depth_ref_rate_mps", 0.20);
+        min_depth_ref_m_ = this->declare_parameter<double>("min_depth_ref_m", -100.0);
+        max_depth_ref_m_ = this->declare_parameter<double>("max_depth_ref_m", 100.0);
+        vertical_pwm_sign_ = this->declare_parameter<double>("vertical_pwm_sign", 1.0);
+
+        forward_pwm_ = this->declare_parameter<int>("forward_pwm", 1550);
+        yaw_align_threshold_rad_ = this->declare_parameter<double>("yaw_align_threshold_rad", 0.35);
+        enable_keyboard_stop_ = this->declare_parameter<bool>("enable_keyboard_stop", true);
+        emergency_stop_key_ = this->declare_parameter<std::string>("emergency_stop_key", "q");
+
+        const auto period = std::chrono::duration<double>(1.0 / std::max(control_rate_hz_, 1.0));
+        control_timer_ = this->create_wall_timer(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(period),
+            std::bind(&HomingControllerNode::control_loop, this));
+
+        if (enable_keyboard_stop_) {
+            keyboard_thread_ = std::thread(&HomingControllerNode::keyboard_loop, this);
+            RCLCPP_INFO(
+                this->get_logger(),
+                "Emergency stop enabled. Press '%s' to stop publishing RC override.",
+                emergency_stop_key_.c_str());
+        }
     }
 
-    ~AudioPhaseEstimatorNode()
+    ~HomingControllerNode()
     {
-        {
-            std::lock_guard<std::mutex> lock(buffer_mutex_);
-            stop_worker_ = true;
-        }
-        buffer_cv_.notify_one();
-
-        if (worker_thread_.joinable()) {
-            worker_thread_.join();
+        stop_keyboard_thread_.store(true);
+        if (keyboard_thread_.joinable()) {
+            keyboard_thread_.join();
         }
     }
 
 private:
-    // 상태 x=[u_x,u_y,u_z,b]^T, 관측 z=Delta r=-u^T Delta p + b*Delta t.
-    // b는 단일 하이드로폰에서 주파수/클럭 drift가 거리 변화처럼 보이는 bias range-rate[m/s]이다.
-    class HomingDirectionEkf
+    static constexpr uint16_t NEUTRAL_PWM = 1500;
+    static constexpr int PITCH_CHANNEL_INDEX = 0;
+    static constexpr int ROLL_CHANNEL_INDEX = 1;
+    static constexpr int VERTICAL_CHANNEL_INDEX = 2;
+    static constexpr int YAW_CHANNEL_INDEX = 3;
+    static constexpr int FORWARD_CHANNEL_INDEX = 4;
+    static constexpr int LATERAL_CHANNEL_INDEX = 5;
+
+    struct PidState
     {
-    public:
-        bool update(
-            const Eigen::Vector3d & delta_position_m,
-            const double delta_range_m,
-            const double delta_time_s)
-        {
-            if (delta_time_s <= 0.0) {
-                return false;
-            }
-
-            covariance_ += process_noise_;
-
-            Eigen::Matrix<double, 1, 4> measurement_jacobian;
-            measurement_jacobian << -delta_position_m.x(), -delta_position_m.y(), -delta_position_m.z(), delta_time_s;
-            const double innovation =
-                delta_range_m - static_cast<double>(measurement_jacobian * state_);
-            const double innovation_covariance =
-                static_cast<double>(measurement_jacobian * covariance_ * measurement_jacobian.transpose()) +
-                range_noise_variance_m2_;
-            if (innovation_covariance <= 1.0e-12) {
-                return false;
-            }
-
-            const Eigen::Matrix<double, 4, 1> kalman_gain =
-                covariance_ * measurement_jacobian.transpose() / innovation_covariance;
-
-            state_ += kalman_gain * innovation;
-            covariance_ =
-                (Eigen::Matrix4d::Identity() - kalman_gain * measurement_jacobian) * covariance_;
-            normalize_direction_state();
-            return delta_position_m.squaredNorm() >= min_motion_squared_m2_;
-        }
-
-        Eigen::Vector3d normalized_direction() const
-        {
-            const Eigen::Vector3d direction = state_.head<3>();
-            const double norm = direction.norm();
-            if (norm < min_direction_norm_) {
-                return Eigen::Vector3d::Zero();
-            }
-            return direction / norm;
-        }
-
-        double bias_range_rate_mps() const
-        {
-            return state_(3);
-        }
-
-    private:
-        void normalize_direction_state()
-        {
-            Eigen::Vector3d direction = state_.head<3>();
-            const double norm = direction.norm();
-            if (norm < min_direction_norm_) {
-                return;
-            }
-            state_.head<3>() = direction / norm;
-        }
-
-        Eigen::Matrix<double, 4, 1> state_{1.0, 0.0, 0.0, 0.0};
-        Eigen::Matrix4d covariance_ = Eigen::Matrix4d::Identity() * 10.0;
-        Eigen::Matrix4d process_noise_ = []() {
-            Eigen::Matrix4d noise = Eigen::Matrix4d::Identity() * 1.0e-4;
-            noise(3, 3) = 1.0e-3;
-            return noise;
-        }();
-        double range_noise_variance_m2_ = 1.0e-3;
-        double min_motion_squared_m2_ = 1.0e-6;
-        double min_direction_norm_ = 1.0e-9;
-    };
-    struct TimedSample
-    {
-        double value = 0.0;
-        rclcpp::Time stamp;
+        double integral = 0.0;
+        double previous_error = 0.0;
+        bool have_previous_error = false;
     };
 
-    struct TimedVector2
+    void direction_callback(const geometry_msgs::msg::Vector3Stamped::ConstSharedPtr msg)
     {
-        rclcpp::Time stamp;
-        Eigen::Vector2d value{0.0, 0.0};
-    };
-
-    struct TimedScalar
-    {
-        rclcpp::Time stamp;
-        double value = 0.0;
-    };
-
-    void audio_callback(const audio_common_msgs::msg::AudioData::ConstSharedPtr msg)
-    {
-        const rclcpp::Time buffer_start_stamp = estimate_audio_buffer_start_stamp(msg->data.size());
-        {
-            std::lock_guard<std::mutex> lock(buffer_mutex_);
-            append_samples_from_pcm(msg->data, buffer_start_stamp);
-        }
-        buffer_cv_.notify_one();
-    }
-
-    void dvl_odometry_callback(const nav_msgs::msg::Odometry::ConstSharedPtr msg)
-    {
-        std::lock_guard<std::mutex> lock(dvl_mutex_);
-        odometry_buffer_.push_back({
-            this->now(),
-            Eigen::Vector2d(msg->pose.pose.position.x, msg->pose.pose.position.y)});
-        trim_old_samples(odometry_buffer_);
-    }
-
-    void depth_pose_callback(const geometry_msgs::msg::PoseWithCovarianceStamped::ConstSharedPtr msg)
-    {
-        std::lock_guard<std::mutex> lock(dvl_mutex_);
-        depth_buffer_.push_back({this->now(), msg->pose.pose.position.z});
-        trim_old_samples(depth_buffer_);
-    }
-
-    bool interpolate_position(const rclcpp::Time & stamp, Eigen::Vector3d & position_m) const
-    {
-        Eigen::Vector2d xy;
-        double z = 0.0;
-        if (!interpolate_xy(stamp, xy) || !hold_depth(stamp, z)) {
-            return false;
-        }
-        position_m = Eigen::Vector3d(xy.x(), xy.y(), z);
-        return true;
-    }
-
-    bool interpolate_xy(const rclcpp::Time & stamp, Eigen::Vector2d & value) const
-    {
-        if (odometry_buffer_.size() < 2 ||
-            stamp < odometry_buffer_.front().stamp ||
-            stamp > odometry_buffer_.back().stamp)
-        {
-            return false;
-        }
-
-        for (std::size_t i = 1; i < odometry_buffer_.size(); ++i) {
-            if (stamp <= odometry_buffer_[i].stamp) {
-                const double dt = (odometry_buffer_[i].stamp - odometry_buffer_[i - 1].stamp).seconds();
-                if (dt <= 0.0) {
-                    return false;
-                }
-                const double alpha = (stamp - odometry_buffer_[i - 1].stamp).seconds() / dt;
-                value = odometry_buffer_[i - 1].value +
-                    alpha * (odometry_buffer_[i].value - odometry_buffer_[i - 1].value);
-                return true;
-            }
-        }
-        return false;
-    }
-
-    bool hold_depth(const rclcpp::Time & stamp, double & value) const
-    {
-        if (depth_buffer_.empty() || stamp < depth_buffer_.front().stamp) {
-            return false;
-        }
-
-        value = depth_buffer_.front().value;
-        for (const auto & sample : depth_buffer_) {
-            if (sample.stamp > stamp) {
-                break;
-            }
-            value = sample.value;
-        }
-        return true;
-    }
-
-    template<typename SampleT>
-    void trim_old_samples(std::deque<SampleT> & buffer) const
-    {
-        while (buffer.size() > max_pose_buffer_size_) {
-            buffer.pop_front();
-        }
-    }
-    void analysis_loop()
-    {
-        while (rclcpp::ok()) {
-            std::vector<double> window;
-            rclcpp::Time window_start_stamp;
-            std::uint64_t window_start_sample = 0;
-
-            {
-                std::unique_lock<std::mutex> lock(buffer_mutex_);
-                buffer_cv_.wait(lock, [this]() {
-                    return stop_worker_ || sample_buffer_.size() >= window_size_ + sync_delay_samples();
-                });
-
-                if (stop_worker_) {
-                    break;
-                }
-
-                window.reserve(window_size_);
-                window_start_stamp = sample_buffer_.front().stamp;
-                for (std::size_t i = 0; i < window_size_; ++i) {
-                    window.push_back(sample_buffer_[i].value);
-                }
-                sample_buffer_.erase(sample_buffer_.begin(), sample_buffer_.begin() + window_size_);
-                window_start_sample = next_window_start_sample_;
-                next_window_start_sample_ += window_size_;
-            }
-
-            analyze_window(window, window_start_sample, window_start_stamp);
-        }
-    }
-
-    std::size_t sync_delay_samples() const
-    {
-        return static_cast<std::size_t>(
-            std::ceil(std::max(sync_delay_s_, 0.0) * static_cast<double>(sampling_rate_)));
-    }
-
-    void analyze_window(
-        const std::vector<double> & window,
-        const std::uint64_t window_start_sample,
-        const rclcpp::Time & window_start_stamp)
-    {
-        const auto window_duration = rclcpp::Duration::from_seconds(
-            static_cast<double>(window.size()) / static_cast<double>(sampling_rate_));
-        const rclcpp::Time window_center_stamp =
-            window_start_stamp + rclcpp::Duration::from_seconds(0.5 * window_duration.seconds());
-
-        update_demodulation_frequency(window, window_start_sample);
-
-        // coarse lock된 주파수로 복조해 baseband 복소값 z_k = I + jQ를 얻는다.
-        const std::complex<double> iq = demodulate_iq(window, window_start_sample, demodulation_frequency_hz_);//Z_k = x[n] * exp(-j 2*pi*f_demod*t)
-        if (std::abs(iq) < min_iq_magnitude_) {
-            have_previous_iq_ = false;
+        const double norm = std::sqrt(
+            msg->vector.x * msg->vector.x +
+            msg->vector.y * msg->vector.y +
+            msg->vector.z * msg->vector.z);
+        if (norm < 1.0e-6) {
             return;
         }
 
-        double delta_phase_rad = 0.0;  //delta_theta_k = theta_k - theta_k-1
-        double delta_range_m = 0.0; // Delta r = -lambda * Delta theta / (2*pi)
-        if (have_previous_iq_) {  //theta_k-1가 있으면
-            double delta_time_s = (window_center_stamp - previous_iq_stamp_).seconds();
-            if (delta_time_s <= 0.0) {
-                delta_time_s = window_duration.seconds();
-            }
+        direction_x_ = msg->vector.x / norm;
+        direction_y_ = msg->vector.y / norm;
+        direction_z_ = msg->vector.z / norm;
+        last_direction_time_ = this->now();
+        have_direction_ = true;
+    }
 
-            // 두 window의 켤레곱을 쓰면 -pi~pi 범위의 안정적인 위상차를 바로 얻을 수 있다.
-            const std::complex<double> phase_step = iq * std::conj(previous_iq_);//Z_k * Z_k-1^*
-            delta_phase_rad = std::atan2(std::imag(phase_step), std::real(phase_step));
-            const double observed_frequency_offset_hz =
-                delta_phase_rad / (2.0 * M_PI * std::max(delta_time_s, 1.0e-6));
-            delta_range_m = -current_wavelength_m() * delta_phase_rad / (2.0 * M_PI);
-            publish_phase_debug(
-                delta_phase_rad,
-                delta_range_m,
-                observed_frequency_offset_hz,
-                std::abs(iq));
-            update_homing_estimate(
-                delta_range_m,
-                delta_time_s,
-                previous_iq_stamp_,
-                window_center_stamp);
+    void odometry_callback(const nav_msgs::msg::Odometry::ConstSharedPtr msg)
+    {
+        current_yaw_rad_ = yaw_from_quaternion(
+            msg->pose.pose.orientation.w,
+            msg->pose.pose.orientation.x,
+            msg->pose.pose.orientation.y,
+            msg->pose.pose.orientation.z);
+        have_yaw_ = true;
+    }
+
+    void depth_callback(const geometry_msgs::msg::PoseWithCovarianceStamped::ConstSharedPtr msg)
+    {
+        current_depth_m_ = msg->pose.pose.position.z;
+        if (!have_depth_ref_) {
+            depth_ref_m_ = current_depth_m_;
+            have_depth_ref_ = true;
         }
-        previous_iq_ = iq;
-        previous_iq_stamp_ = window_center_stamp;
-        have_previous_iq_ = true;
+        have_depth_ = true;
     }
 
-    std::complex<double> demodulate_iq(
-        const std::vector<double> & window,
-        const std::uint64_t window_start_sample,
-        const double frequency_hz) const
+    void control_loop()
     {
-        std::complex<double> baseband_sum(0.0, 0.0);
-        double weight_sum = 0.0;
-        const double phase_step = 2.0 * M_PI * frequency_hz / static_cast<double>(sampling_rate_);
-        const double hann_denominator = static_cast<double>(std::max<std::size_t>(1, window.size() - 1));
-
-        for (std::size_t n = 0; n < window.size(); ++n) {
-            const double weight =
-                0.5 * (1.0 - std::cos((2.0 * M_PI * static_cast<double>(n)) / hann_denominator));
-            // 1) I/Q 복조: x[n] * exp(-j 2*pi*f_ref*t)로 carrier를 baseband로 내린다.
-            const double phase = phase_step * static_cast<double>(window_start_sample + n);
-            const std::complex<double> mixed_sample =
-                weight * window[n] * std::complex<double>(std::cos(phase), -std::sin(phase));
-            baseband_sum += mixed_sample;
-            weight_sum += weight;
+        const rclcpp::Time now = this->now();
+        const double dt = compute_dt(now);
+        if (!homing_enabled_.load() || !have_direction_ || !have_yaw_ || !have_depth_ || !have_depth_ref_) {
+            reset_controller_state();
+            publish_neutral_failsafe();
+            return;
         }
-
-        // 2) LPF: 한 window 동안의 baseband 평균을 내서 2*f_ref 성분과 빠른 흔들림을 제거한다.
-        return baseband_sum / std::max(weight_sum, 1.0e-12);
-    }
-
-    double current_wavelength_m() const
-    {
-        return sound_speed_mps_ / std::max(demodulation_frequency_hz_, 1.0);
-    }
-
-    void update_demodulation_frequency(
-        const std::vector<double> & window,
-        const std::uint64_t window_start_sample)
-    {
-        if (!enable_frequency_acquisition_ || have_frequency_lock_) {
+        if ((now - last_direction_time_).seconds() > direction_timeout_s_) {
+            reset_controller_state();
+            publish_neutral_failsafe();
             return;
         }
 
-        double acquired_frequency_hz = demodulation_frequency_hz_;
-        if (!estimate_peak_frequency_hz(window, window_start_sample, acquired_frequency_hz)) {
+        const double yaw_ref_rad = std::atan2(direction_y_, direction_x_);
+        const double yaw_error_rad = wrap_pi(yaw_ref_rad - current_yaw_rad_);
+
+        depth_ref_m_ += depth_ref_rate_mps_ * direction_z_ * dt;
+        depth_ref_m_ = std::clamp(depth_ref_m_, min_depth_ref_m_, max_depth_ref_m_);
+        const double depth_error_m = depth_ref_m_ - current_depth_m_;
+
+        const double yaw_pwm_delta =
+            std::clamp(pid_update(yaw_pid_, yaw_error_rad, dt, yaw_kp_, yaw_ki_, yaw_kd_), -yaw_pwm_limit_, yaw_pwm_limit_);
+        const double depth_pwm_delta =
+            std::clamp(pid_update(depth_pid_, depth_error_m, dt, depth_kp_, depth_ki_, depth_kd_),
+                -depth_pwm_limit_, depth_pwm_limit_);
+
+        auto rc_msg = make_neutral_override_msg();
+
+        const uint16_t desired_yaw_pwm = pwm_from_delta(yaw_pwm_delta);
+        const uint16_t desired_vertical_pwm = pwm_from_delta(vertical_pwm_sign_ * depth_pwm_delta);
+        const uint16_t desired_forward_pwm =
+            std::abs(yaw_error_rad) < yaw_align_threshold_rad_ ? clamp_pwm(forward_pwm_) : NEUTRAL_PWM;
+
+        rc_msg.channels[YAW_CHANNEL_INDEX] =
+            slew_limit_pwm(desired_yaw_pwm, previous_yaw_pwm_, have_previous_yaw_pwm_, dt);
+        rc_msg.channels[VERTICAL_CHANNEL_INDEX] =
+            slew_limit_pwm(desired_vertical_pwm, previous_vertical_pwm_, have_previous_vertical_pwm_, dt);
+        rc_msg.channels[FORWARD_CHANNEL_INDEX] =
+            slew_limit_pwm(desired_forward_pwm, previous_forward_pwm_, have_previous_forward_pwm_, dt);
+        rc_pub_->publish(rc_msg);
+        neutral_failsafe_sent_ = false;
+    }
+
+    double compute_dt(const rclcpp::Time & now)
+    {
+        if (!have_previous_control_time_) {
+            previous_control_time_ = now;
+            have_previous_control_time_ = true;
+            return 1.0 / std::max(control_rate_hz_, 1.0);
+        }
+        const double dt = (now - previous_control_time_).seconds();
+        previous_control_time_ = now;
+        return std::clamp(dt, 1.0e-3, 0.5);
+    }
+
+    double pid_update(
+        PidState & state,
+        const double error,
+        const double dt,
+        const double kp,
+        const double ki,
+        const double kd) const
+    {
+        state.integral += error * dt;
+        state.integral = std::clamp(state.integral, -integral_limit_, integral_limit_);
+
+        double derivative = 0.0;
+        if (state.have_previous_error) {
+            derivative = (error - state.previous_error) / dt;
+        }
+        state.previous_error = error;
+        state.have_previous_error = true;
+        return kp * error + ki * state.integral + kd * derivative;
+    }
+
+    void reset_controller_state()
+    {
+        yaw_pid_ = PidState{};
+        depth_pid_ = PidState{};
+        have_previous_yaw_pwm_ = false;
+        have_previous_vertical_pwm_ = false;
+        have_previous_forward_pwm_ = false;
+    }
+
+    mavros_msgs::msg::OverrideRCIn make_neutral_override_msg() const
+    {
+        mavros_msgs::msg::OverrideRCIn rc_msg;
+        rc_msg.channels.fill(mavros_msgs::msg::OverrideRCIn::CHAN_NOCHANGE);
+        rc_msg.channels[PITCH_CHANNEL_INDEX] = NEUTRAL_PWM;
+        rc_msg.channels[ROLL_CHANNEL_INDEX] = NEUTRAL_PWM;
+        rc_msg.channels[VERTICAL_CHANNEL_INDEX] = NEUTRAL_PWM;
+        rc_msg.channels[YAW_CHANNEL_INDEX] = NEUTRAL_PWM;
+        rc_msg.channels[FORWARD_CHANNEL_INDEX] = NEUTRAL_PWM;
+        rc_msg.channels[LATERAL_CHANNEL_INDEX] = NEUTRAL_PWM;
+        return rc_msg;
+    }
+
+    void publish_neutral_failsafe()
+    {
+        if (!publish_neutral_when_inactive_) {
             return;
         }
 
-        const double frequency_step_hz = acquired_frequency_hz - demodulation_frequency_hz_;
-        if (std::abs(frequency_step_hz) < frequency_reacquire_threshold_hz_) {
-            demodulation_frequency_hz_ = acquired_frequency_hz;
-            have_frequency_lock_ = true;
+        const auto rc_msg = make_neutral_override_msg();
+        rc_pub_->publish(rc_msg);
+        if (!neutral_failsafe_sent_) {
             RCLCPP_WARN(
                 this->get_logger(),
-                "Acquired demodulation frequency %.3f Hz.",
-                demodulation_frequency_hz_);
-            return;
+                "Publishing neutral RC override while homing is inactive or waiting for inputs.");
         }
-
-        demodulation_frequency_hz_ = acquired_frequency_hz;
-        have_frequency_lock_ = true;
-        have_previous_iq_ = false;
-        RCLCPP_WARN(
-            this->get_logger(),
-            "Acquired demodulation frequency %.3f Hz; phase tracking reset.",
-            demodulation_frequency_hz_);
+        neutral_failsafe_sent_ = true;
     }
 
-    bool estimate_peak_frequency_hz(
-        const std::vector<double> & window,
-        const std::uint64_t window_start_sample,
-        double & peak_frequency_hz) const
+    uint16_t slew_limit_pwm(
+        const uint16_t desired_pwm,
+        uint16_t & previous_pwm,
+        bool & have_previous_pwm,
+        const double dt)
     {
-        if (frequency_search_half_width_hz_ <= 0.0 || frequency_search_step_hz_ <= 0.0) {
-            return false;
+        if (!have_previous_pwm) {
+            previous_pwm = desired_pwm;
+            have_previous_pwm = true;
+            return previous_pwm;
         }
 
-        const double search_start_hz =
-            std::max(1.0, reference_frequency_hz_ - frequency_search_half_width_hz_);
-        const double search_end_hz = reference_frequency_hz_ + frequency_search_half_width_hz_;
-        double best_magnitude = -1.0;
-        double best_frequency_hz = reference_frequency_hz_;
+        const double max_step = std::max(0.0, pwm_slew_rate_per_s_) * dt;
+        const double delta = std::clamp(
+            static_cast<double>(desired_pwm) - static_cast<double>(previous_pwm),
+            -max_step,
+            max_step);
+        previous_pwm = clamp_pwm(static_cast<int>(std::lround(static_cast<double>(previous_pwm) + delta)));
+        return previous_pwm;
+    }
 
-        for (double frequency_hz = search_start_hz;
-            frequency_hz <= search_end_hz + 0.5 * frequency_search_step_hz_;
-            frequency_hz += frequency_search_step_hz_)
-        {
-            const double magnitude = std::abs(demodulate_iq(window, window_start_sample, frequency_hz));
-            if (magnitude > best_magnitude) {
-                best_magnitude = magnitude;
-                best_frequency_hz = frequency_hz;
+    void keyboard_loop()
+    {
+        termios original_termios;
+        bool restore_terminal = false;
+        if (isatty(STDIN_FILENO) && tcgetattr(STDIN_FILENO, &original_termios) == 0) {
+            termios raw_termios = original_termios;
+            raw_termios.c_lflag &= static_cast<tcflag_t>(~(ICANON | ECHO));
+            raw_termios.c_cc[VMIN] = 0;
+            raw_termios.c_cc[VTIME] = 0;
+            restore_terminal = tcsetattr(STDIN_FILENO, TCSANOW, &raw_termios) == 0;
+        }
+
+        while (rclcpp::ok() && !stop_keyboard_thread_.load()) {
+            fd_set read_fds;
+            FD_ZERO(&read_fds);
+            FD_SET(STDIN_FILENO, &read_fds);
+
+            timeval timeout;
+            timeout.tv_sec = 0;
+            timeout.tv_usec = 100000;
+
+            const int ready = select(STDIN_FILENO + 1, &read_fds, nullptr, nullptr, &timeout);
+            if (ready <= 0 || !FD_ISSET(STDIN_FILENO, &read_fds)) {
+                continue;
             }
-        }
 
-        if (best_magnitude < min_iq_magnitude_) {
-            return false;
-        }
-
-        peak_frequency_hz = best_frequency_hz;
-        return true;
-    }
-
-    void append_samples_from_pcm(const std::vector<uint8_t> & data, const rclcpp::Time & buffer_start_stamp)
-    {
-        // /audio는 S32LE 2채널 interleaved PCM이므로 선택한 채널만 double 샘플로 변환한다.
-        const std::size_t channel_offset = channel_index_ * bytes_per_sample_;
-        std::uint64_t frame_index = 0;
-        for (std::size_t frame_start = 0; frame_start + frame_size_ <= data.size();
-            frame_start += frame_size_)
-        {
-            const int32_t sample = read_int32_little_endian(data, frame_start + channel_offset);
-            const auto sample_offset = rclcpp::Duration::from_seconds(
-                static_cast<double>(frame_index) / static_cast<double>(sampling_rate_));
-            sample_buffer_.push_back({
-                static_cast<double>(sample) / 2147483648.0,
-                buffer_start_stamp + sample_offset});
-            ++frame_index;
-        }
-    }
-
-    rclcpp::Time estimate_audio_buffer_start_stamp(const std::size_t byte_count)
-    {
-        const std::size_t frame_count = byte_count / frame_size_;
-        const auto buffer_duration = rclcpp::Duration::from_seconds(
-            static_cast<double>(frame_count) / static_cast<double>(sampling_rate_));
-        return this->now() - buffer_duration;
-    }
-
-    int32_t read_int32_little_endian(const std::vector<uint8_t> & data, const std::size_t offset) const
-    {
-        const uint32_t raw =
-            static_cast<uint32_t>(data[offset]) |
-            (static_cast<uint32_t>(data[offset + 1]) << 8) |
-            (static_cast<uint32_t>(data[offset + 2]) << 16) |
-            (static_cast<uint32_t>(data[offset + 3]) << 24);
-        return static_cast<int32_t>(raw);
-    }
-
-    void publish_phase_debug(
-        const double delta_phase_rad,
-        const double delta_range_m,
-        const double observed_frequency_offset_hz,
-        const double iq_magnitude)
-    {
-        std_msgs::msg::Float64 delta_phase_msg;
-        delta_phase_msg.data = delta_phase_rad;
-        delta_phase_pub_->publish(delta_phase_msg);
-
-        std_msgs::msg::Float64 delta_range_msg;
-        delta_range_msg.data = delta_range_m;
-        delta_range_pub_->publish(delta_range_msg);
-
-        std_msgs::msg::Float64 iq_magnitude_msg;
-        iq_magnitude_msg.data = iq_magnitude;
-        iq_magnitude_pub_->publish(iq_magnitude_msg);
-
-        std_msgs::msg::Float64 observed_offset_msg;
-        observed_offset_msg.data = observed_frequency_offset_hz;
-        observed_frequency_offset_pub_->publish(observed_offset_msg);
-
-        std_msgs::msg::Float64 demodulation_frequency_msg;
-        demodulation_frequency_msg.data = demodulation_frequency_hz_;
-        demodulation_frequency_pub_->publish(demodulation_frequency_msg);
-    }
-
-    void update_homing_estimate(
-        const double delta_range_m,
-        const double delta_time_s,
-        const rclcpp::Time & window_start_stamp,
-        const rclcpp::Time & window_end_stamp)
-    {
-        Eigen::Vector3d start_position_m;
-        Eigen::Vector3d end_position_m;
-        {
-            std::lock_guard<std::mutex> lock(dvl_mutex_);
-            if (!interpolate_position(window_start_stamp, start_position_m) ||
-                !interpolate_position(window_end_stamp, end_position_m))
-            {
-                RCLCPP_WARN_THROTTLE(
+            char input = '\0';
+            const ssize_t bytes_read = read(STDIN_FILENO, &input, 1);
+            if (bytes_read == 0) {
+                break;
+            }
+            if (bytes_read < 0) {
+                continue;
+            }
+            if (!emergency_stop_key_.empty() && input == emergency_stop_key_.front()) {
+                homing_enabled_.store(false);
+                RCLCPP_WARN(
                     this->get_logger(),
-                    *this->get_clock(),
-                    1000,
-                    "homing update skipped: receive-time odometry/depth buffer does not cover audio window [%.6f, %.6f]",
-                    window_start_stamp.seconds(),
-                    window_end_stamp.seconds());
-                return;
+                    "Emergency stop key '%c' received. Homing disabled; RC override publishing stopped.",
+                    input);
             }
         }
 
-        const Eigen::Vector3d delta_position_m = end_position_m - start_position_m;
-        const bool direction_observable =
-            homing_direction_ekf_.update(delta_position_m, delta_range_m, delta_time_s);
-        publish_homing_bias_debug();
-        if (!direction_observable) {
-            return;
+        if (restore_terminal) {
+            tcsetattr(STDIN_FILENO, TCSANOW, &original_termios);
         }
-
-        const Eigen::Vector3d direction = homing_direction_ekf_.normalized_direction();
-        if (direction.isZero()) {
-            return;
-        }
-        const Eigen::Vector3d filtered_direction = filter_direction(direction);
-
-        geometry_msgs::msg::Vector3Stamped direction_msg;
-        direction_msg.header.stamp = this->now();
-        direction_msg.header.frame_id = "dvl";
-        direction_msg.vector.x = filtered_direction.x();
-        direction_msg.vector.y = filtered_direction.y();
-        direction_msg.vector.z = filtered_direction.z();
-        homing_direction_pub_->publish(direction_msg);
     }
 
-    void publish_homing_bias_debug()
+    uint16_t pwm_from_delta(const double pwm_delta) const
     {
-        const double bias_range_rate_mps = homing_direction_ekf_.bias_range_rate_mps();
-
-        std_msgs::msg::Float64 bias_range_rate_msg;
-        bias_range_rate_msg.data = bias_range_rate_mps;
-        homing_bias_range_rate_pub_->publish(bias_range_rate_msg);
-
-        std_msgs::msg::Float64 bias_frequency_msg;
-        bias_frequency_msg.data = -bias_range_rate_mps / current_wavelength_m();
-        homing_bias_frequency_pub_->publish(bias_frequency_msg);
+        return clamp_pwm(static_cast<int>(std::lround(static_cast<double>(NEUTRAL_PWM) + pwm_delta)));
     }
 
-    Eigen::Vector3d filter_direction(const Eigen::Vector3d & direction)
+    uint16_t clamp_pwm(const int pwm) const
     {
-        const double alpha = std::clamp(direction_filter_alpha_, 0.0, 1.0);
-        if (!have_filtered_direction_) {
-            filtered_direction_ = direction;
-            have_filtered_direction_ = true;
-            return filtered_direction_;
-        }
-
-        filtered_direction_ = (1.0 - alpha) * filtered_direction_ + alpha * direction;
-        const double norm = filtered_direction_.norm();
-        if (norm < 1.0e-9) {
-            filtered_direction_ = direction;
-        } else {
-            filtered_direction_ /= norm;
-        }
-        return filtered_direction_;
+        return static_cast<uint16_t>(std::clamp(pwm, 1100, 1900));
     }
 
-    rclcpp::Subscription<audio_common_msgs::msg::AudioData>::SharedPtr audio_sub_;
-    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr dvl_odom_sub_;
-    rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr depth_pose_sub_;
-    rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr homing_direction_pub_;
-    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr delta_phase_pub_;
-    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr delta_range_pub_;
-    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr iq_magnitude_pub_;
-    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr observed_frequency_offset_pub_;
-    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr demodulation_frequency_pub_;
-    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr homing_bias_range_rate_pub_;
-    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr homing_bias_frequency_pub_;
+    double yaw_from_quaternion(const double w, const double x, const double y, const double z) const
+    {
+        return std::atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z));
+    }
 
-    std::vector<TimedSample> sample_buffer_;
-    std::mutex buffer_mutex_;
-    std::condition_variable buffer_cv_;
-    std::thread worker_thread_;
-    bool stop_worker_ = false;
+    double wrap_pi(double angle_rad) const
+    {
+        while (angle_rad > M_PI) {
+            angle_rad -= 2.0 * M_PI;
+        }
+        while (angle_rad < -M_PI) {
+            angle_rad += 2.0 * M_PI;
+        }
+        return angle_rad;
+    }
 
-    std::size_t channels_ = 2;
-    std::size_t channel_index_ = 0;
-    std::size_t bytes_per_sample_ = 4;
-    std::size_t frame_size_ = channels_ * bytes_per_sample_;
+    rclcpp::Subscription<geometry_msgs::msg::Vector3Stamped>::SharedPtr direction_sub_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odometry_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr depth_sub_;
+    rclcpp::Publisher<mavros_msgs::msg::OverrideRCIn>::SharedPtr rc_pub_;
+    rclcpp::TimerBase::SharedPtr control_timer_;
 
-    std::size_t window_size_ = 4096;
-    std::uint64_t next_window_start_sample_ = 0;
-    std::size_t sampling_rate_ = 96000;
-    double reference_frequency_hz_ = 21164.0; //27211.0도 있을 수 있음.
-    double sound_speed_mps_ = 1500.0; // 수조/해역에 맞춰 보정할 음속.
-    double demodulation_frequency_hz_ = 21164.0;
-    bool enable_frequency_acquisition_ = true;
-    bool have_frequency_lock_ = false;
-    double frequency_search_half_width_hz_ = 1000.0;
-    double frequency_search_step_hz_ = 10.0;
-    double frequency_reacquire_threshold_hz_ = 50.0;
-    double min_iq_magnitude_ = 1.0e-8;
-    double sync_delay_s_ = 0.10;
-    double direction_filter_alpha_ = 0.12;
+    std::atomic_bool homing_enabled_{true};
+    double control_rate_hz_ = 20.0;
+    double direction_timeout_s_ = 1.0;
+    double pwm_slew_rate_per_s_ = 300.0;
+    bool publish_neutral_when_inactive_ = true;
 
-    bool have_previous_iq_ = false;
-    std::complex<double> previous_iq_{0.0, 0.0};
-    rclcpp::Time previous_iq_stamp_;
-    HomingDirectionEkf homing_direction_ekf_;
-    Eigen::Vector3d filtered_direction_{1.0, 0.0, 0.0};
-    bool have_filtered_direction_ = false;
-    std::mutex dvl_mutex_;
-    std::deque<TimedVector2> odometry_buffer_;
-    std::deque<TimedScalar> depth_buffer_;
-    std::size_t max_pose_buffer_size_ = 200;
+    double yaw_kp_ = 180.0;
+    double yaw_ki_ = 0.0;
+    double yaw_kd_ = 20.0;
+    double yaw_pwm_limit_ = 180.0;
+
+    double depth_kp_ = 180.0;
+    double depth_ki_ = 0.0;
+    double depth_kd_ = 30.0;
+    double depth_pwm_limit_ = 180.0;
+    double depth_ref_rate_mps_ = 0.20;
+    double min_depth_ref_m_ = -100.0;
+    double max_depth_ref_m_ = 100.0;
+    double vertical_pwm_sign_ = 1.0;
+    int forward_pwm_ = 1550;
+    double yaw_align_threshold_rad_ = 0.35;
+    double integral_limit_ = 2.0;
+    bool enable_keyboard_stop_ = true;
+    std::string emergency_stop_key_ = "q";
+
+    double direction_x_ = 1.0;
+    double direction_y_ = 0.0;
+    double direction_z_ = 0.0;
+    rclcpp::Time last_direction_time_;
+    bool have_direction_ = false;
+
+    double current_yaw_rad_ = 0.0;
+    double current_depth_m_ = 0.0;
+    double depth_ref_m_ = 0.0;
+    bool have_yaw_ = false;
+    bool have_depth_ = false;
+    bool have_depth_ref_ = false;
+
+    PidState yaw_pid_;
+    PidState depth_pid_;
+    rclcpp::Time previous_control_time_;
+    bool have_previous_control_time_ = false;
+
+    uint16_t previous_yaw_pwm_ = NEUTRAL_PWM;
+    uint16_t previous_vertical_pwm_ = NEUTRAL_PWM;
+    uint16_t previous_forward_pwm_ = NEUTRAL_PWM;
+    bool have_previous_yaw_pwm_ = false;
+    bool have_previous_vertical_pwm_ = false;
+    bool have_previous_forward_pwm_ = false;
+    bool neutral_failsafe_sent_ = false;
+
+    std::atomic_bool stop_keyboard_thread_{false};
+    std::thread keyboard_thread_;
 };
 }
 
-RCLCPP_COMPONENTS_REGISTER_NODE(audio_capture::AudioPhaseEstimatorNode)
+RCLCPP_COMPONENTS_REGISTER_NODE(audio_capture::HomingControllerNode)
