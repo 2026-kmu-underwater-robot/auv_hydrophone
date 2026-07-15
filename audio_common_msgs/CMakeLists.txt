@@ -9,6 +9,7 @@ set(msg_files
   "msg/AudioData.msg"
   "msg/AudioDataStamped.msg"
   "msg/AudioInfo.msg"
+  "msg/Float64Stamped.msg"
 )
 
 rosidl_generate_interfaces(${PROJECT_NAME}

@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 
+#include <audio_common_msgs/msg/float64_stamped.hpp>
 #include <Eigen/Dense>
 #include <geometry_msgs/msg/point_stamped.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
@@ -18,6 +19,8 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_components/register_node_macro.hpp>
 #include <std_msgs/msg/float64.hpp>
+#include <std_msgs/msg/bool.hpp>
+#include <std_msgs/msg/empty.hpp>
 
 namespace audio_capture
 {
@@ -38,16 +41,22 @@ public:
       rng_(static_cast<std::uint32_t>(declare_parameter<std::int64_t>("random_seed", 7)))
     {
         // 설정 분기 A: ROS 입력/출력 토픽.
-        snr_topic_ = declare_parameter<std::string>("snr_topic", "/audio_phase_estimator/iq_snr_ratio");
+        snr_topic_ = declare_parameter<std::string>(
+            "snr_topic", "/audio_phase_estimator/iq_snr_ratio_stamped");
         odometry_topic_ = declare_parameter<std::string>("odometry_topic", "/odometry/filtered");
         depth_topic_ = declare_parameter<std::string>("depth_topic", "/depth/pose");
         direction_topic_ = declare_parameter<std::string>("direction_topic", "/homing/direction");
         confidence_topic_ = declare_parameter<std::string>("confidence_topic", "/homing/snr_confidence");
         source_estimate_topic_ =
             declare_parameter<std::string>("source_estimate_topic", "/homing/source_estimate");
+        estimator_ready_topic_ =
+            declare_parameter<std::string>("estimator_ready_topic", "/homing/estimator_ready");
+        near_source_topic_ =
+            declare_parameter<std::string>("near_source_topic", "/homing/near_source");
+        reset_topic_ = declare_parameter<std::string>("reset_topic", "/homing/reset_estimator");
 
         // 설정 분기 B: 위치 정보 출처와 방향 출력 좌표계.
-        output_frame_ = declare_parameter<std::string>("output_frame", "odom");
+        output_frame_ = declare_parameter<std::string>("output_frame", "base_link");
         output_frame_id_ = declare_parameter<std::string>("output_frame_id", "");
         use_depth_pose_ = declare_parameter<bool>("use_depth_pose", true);
         horizontal_only_ = declare_parameter<bool>("horizontal_only", true);
@@ -66,6 +75,23 @@ public:
             std::clamp(declare_parameter<double>("direction_filter_alpha", 0.25), 0.0, 1.0);
         covariance_regularization_ =
             std::max(1.0e-12, declare_parameter<double>("covariance_regularization", 1.0e-4));
+        min_trajectory_coverage_ratio_ = std::clamp(
+            declare_parameter<double>("min_trajectory_coverage_ratio", 0.12), 0.0, 1.0);
+        gradient_stability_window_ = static_cast<std::size_t>(std::max<std::int64_t>(
+            3, declare_parameter<std::int64_t>("gradient_stability_window", 8)));
+        max_gradient_std_rad_ = std::clamp(
+            declare_parameter<double>("max_gradient_std_rad", 0.30), 0.01, PI);
+        snr_median_window_ = static_cast<std::size_t>(std::max<std::int64_t>(
+            1, declare_parameter<std::int64_t>("snr_median_window", 5)));
+        odometry_history_age_s_ = std::max(
+            1.0, declare_parameter<double>("odometry_history_age_s", 10.0));
+        max_odometry_extrapolation_s_ = std::max(
+            0.0, declare_parameter<double>("max_odometry_extrapolation_s", 0.10));
+        near_source_distance_m_ = std::max(
+            0.0, declare_parameter<double>("near_source_distance_m", 1.0));
+        near_source_min_snr_ = declare_parameter<double>("near_source_min_snr", 5.0);
+        near_source_max_snr_delta_ = std::max(
+            0.0, declare_parameter<double>("near_source_max_snr_delta", 0.10));
 
         // 설정 분기 D: 선택적인 particle filter 일관성 검사.
         enable_particle_filter_ = declare_parameter<bool>("enable_particle_filter", true);
@@ -82,12 +108,20 @@ public:
         particle_blend_ = std::clamp(declare_parameter<double>("particle_blend", 0.35), 0.0, 1.0);
         particle_motion_deadband_m_ =
             std::max(0.0, declare_parameter<double>("particle_motion_deadband_m", 0.02));
+        particle_snr_scale_ =
+            std::max(1.0e-6, declare_parameter<double>("particle_snr_scale", 0.5));
+        particle_roughening_std_m_ =
+            std::max(0.0, declare_parameter<double>("particle_roughening_std_m", 0.20));
+        particle_cluster_radius_m_ =
+            std::max(0.1, declare_parameter<double>("particle_cluster_radius_m", 2.0));
+        particle_prior_strength_ =
+            std::max(0.0, declare_parameter<double>("particle_prior_strength", 2.0));
         require_particle_agreement_ = declare_parameter<bool>("require_particle_agreement", false);
         particle_agreement_min_dot_ =
             std::clamp(declare_parameter<double>("particle_agreement_min_dot", 0.0), -1.0, 1.0);
 
         // 실행 입력: SNR이 추정을 구동하고 위치 callback이 현재 상태를 유지한다.
-        snr_sub_ = create_subscription<std_msgs::msg::Float64>(
+        snr_sub_ = create_subscription<audio_common_msgs::msg::Float64Stamped>(
             snr_topic_,
             10,
             std::bind(&SnrGradientHomingNode::snr_callback, this, std::placeholders::_1));
@@ -107,6 +141,10 @@ public:
         confidence_pub_ = create_publisher<std_msgs::msg::Float64>(confidence_topic_, 10);
         source_estimate_pub_ =
             create_publisher<geometry_msgs::msg::PointStamped>(source_estimate_topic_, 10);
+        estimator_ready_pub_ = create_publisher<std_msgs::msg::Bool>(estimator_ready_topic_, 10);
+        near_source_pub_ = create_publisher<std_msgs::msg::Bool>(near_source_topic_, 10);
+        reset_sub_ = create_subscription<std_msgs::msg::Empty>(
+            reset_topic_, 10, std::bind(&SnrGradientHomingNode::reset_callback, this, std::placeholders::_1));
 
         RCLCPP_INFO(
             get_logger(),
@@ -134,6 +172,12 @@ private:
         double weight = 1.0;
     };
 
+    struct PoseSample
+    {
+        rclcpp::Time stamp;
+        Eigen::Vector3d position_m{0.0, 0.0, 0.0};
+    };
+
     void odometry_callback(const nav_msgs::msg::Odometry::ConstSharedPtr msg)
     {
         // 1단계: 가장 최근의 수평 위치와 기체 방위를 저장한다.
@@ -150,6 +194,22 @@ private:
             msg->pose.pose.orientation.z);
         odometry_frame_id_ = msg->header.frame_id.empty() ? "odom" : msg->header.frame_id;
         have_pose_ = true;
+        const rclcpp::Time stamp(msg->header.stamp);
+        if (stamp.nanoseconds() > 0) {
+            // rosbag을 다시 처음부터 재생하면 timestamp가 뒤로 이동한다.
+            // 미래 시각의 odometry/gradient/PF 상태를 새 재생에 섞지 않는다.
+            if (!odometry_history_.empty() && stamp < odometry_history_.back().stamp) {
+                odometry_history_.clear();
+                reset_estimator_state();
+                RCLCPP_INFO(get_logger(), "Odometry time moved backwards; estimator state reset.");
+            }
+            odometry_history_.push_back({stamp, current_position_m_});
+            while (!odometry_history_.empty() &&
+                (stamp - odometry_history_.front().stamp).seconds() > odometry_history_age_s_)
+            {
+                odometry_history_.pop_front();
+            }
+        }
     }
 
     void depth_callback(const geometry_msgs::msg::PoseWithCovarianceStamped::ConstSharedPtr msg)
@@ -159,7 +219,7 @@ private:
         have_depth_ = true;
     }
 
-    void snr_callback(const std_msgs::msg::Float64::ConstSharedPtr msg)
+    void snr_callback(const audio_common_msgs::msg::Float64Stamped::ConstSharedPtr msg)
     {
         // 2-a단계: 설정된 위치 입력이 모두 준비될 때까지 SNR을 폐기한다.
         if (!have_pose_ || (use_depth_pose_ && !have_depth_)) {
@@ -170,15 +230,38 @@ private:
             return;
         }
 
+        const rclcpp::Time measurement_stamp(msg->header.stamp);
+        Eigen::Vector3d measurement_position;
+        if (measurement_stamp.nanoseconds() <= 0 ||
+            !interpolate_odometry(measurement_stamp, measurement_position))
+        {
+            RCLCPP_WARN_THROTTLE(
+                get_logger(), *get_clock(), 2000,
+                "No odometry sample for stamped SNR measurement; sample dropped.");
+            return;
+        }
+
+        snr_median_buffer_.push_back(msg->data);
+        while (snr_median_buffer_.size() > snr_median_window_) {
+            snr_median_buffer_.pop_front();
+        }
+        std::vector<double> sorted_snr(snr_median_buffer_.begin(), snr_median_buffer_.end());
+        std::sort(sorted_snr.begin(), sorted_snr.end());
+        const double filtered_snr = sorted_snr[sorted_snr.size() / 2];
+
         Sample sample;
-        sample.stamp = now();
-        sample.position_m = current_position_m_;
-        sample.snr = msg->data;
-        // 분기: 거의 같은 위치의 표본은 한 지점의 과도한 반영을 막기 위해 교체한다.
+        sample.stamp = measurement_stamp;
+        sample.position_m = measurement_position;
+        sample.snr = filtered_snr;
+        // 분기: 거의 같은 위치에서는 공간 기준점을 유지하고 측정값만 갱신한다.
         if (!samples_.empty() &&
             (sample.position_m - samples_.back().position_m).norm() < min_sample_spacing_m_)
         {
-            samples_.back() = sample;
+            // 공간 기준점은 유지해야 누적 이동 거리가 spacing을 넘을 수 있다.
+            // 위치까지 현재 값으로 교체하면 고주기 SNR 입력에서 기준점이 기체를
+            // 계속 따라가므로 새 공간 표본이 영원히 추가되지 않는다.
+            samples_.back().stamp = sample.stamp;
+            samples_.back().snr = sample.snr;
             return;
         }
 
@@ -190,6 +273,57 @@ private:
         samples_.push_back(sample);
         prune_samples(sample.stamp);
         update_direction(sample.stamp);
+    }
+
+    bool interpolate_odometry(const rclcpp::Time & stamp, Eigen::Vector3d & position) const
+    {
+        if (odometry_history_.empty()) {
+            return false;
+        }
+        if (stamp <= odometry_history_.front().stamp) {
+            if ((odometry_history_.front().stamp - stamp).seconds() > max_odometry_extrapolation_s_) {
+                return false;
+            }
+            position = odometry_history_.front().position_m;
+            return true;
+        }
+        if (stamp >= odometry_history_.back().stamp) {
+            if ((stamp - odometry_history_.back().stamp).seconds() > max_odometry_extrapolation_s_) {
+                return false;
+            }
+            position = odometry_history_.back().position_m;
+            return true;
+        }
+        for (std::size_t i = 1; i < odometry_history_.size(); ++i) {
+            if (odometry_history_[i].stamp >= stamp) {
+                const PoseSample & before = odometry_history_[i - 1];
+                const PoseSample & after = odometry_history_[i];
+                const double span = (after.stamp - before.stamp).seconds();
+                const double alpha = span > 0.0 ? (stamp - before.stamp).seconds() / span : 0.0;
+                position = (1.0 - alpha) * before.position_m + alpha * after.position_m;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void reset_callback(const std_msgs::msg::Empty::ConstSharedPtr)
+    {
+        reset_estimator_state();
+        RCLCPP_INFO(get_logger(), "Homing estimator reset for reacquisition.");
+    }
+
+    void reset_estimator_state()
+    {
+        samples_.clear();
+        snr_median_buffer_.clear();
+        gradient_directions_.clear();
+        particles_.clear();
+        particles_initialized_ = false;
+        particle_direction_prior_applied_ = false;
+        last_particle_confidence_ = 0.0;
+        have_filtered_direction_ = false;
+        publish_estimator_status(false, false);
     }
 
     void prune_samples(const rclcpp::Time & stamp)
@@ -211,7 +345,22 @@ private:
         double gradient_confidence = 0.0;
         // 분기: 충분한 이동량과 SNR 변화가 확보될 때까지 발행하지 않는다.
         if (!estimate_gradient_direction(gradient_direction, gradient_confidence)) {
+            publish_estimator_status(false, false);
             return;
+        }
+
+        gradient_directions_.push_back(gradient_direction);
+        while (gradient_directions_.size() > gradient_stability_window_) {
+            gradient_directions_.pop_front();
+        }
+        const bool gradient_stable = is_gradient_direction_stable();
+        const bool estimator_ready =
+            trajectory_coverage_ratio_ >= min_trajectory_coverage_ratio_ && gradient_stable;
+        publish_estimator_status(estimator_ready, estimate_near_source());
+
+        // 충분한 공간 표본으로 처음 얻은 gradient를 PF의 방향성 prior로 한 번 반영한다.
+        if (enable_particle_filter_ && estimator_ready && !particle_direction_prior_applied_) {
+            apply_particle_direction_prior(gradient_direction);
         }
 
         // 기본 분기: PF가 비활성/사용 불가하거나 direction_source가 "gradient"이면
@@ -262,7 +411,7 @@ private:
         }
     }
 
-    bool estimate_gradient_direction(Eigen::Vector3d & direction, double & confidence) const
+    bool estimate_gradient_direction(Eigen::Vector3d & direction, double & confidence)
     {
         // 관측 가능성 검사 A: 회귀 계산에 필요한 최소 표본 수를 확인한다.
         if (samples_.size() < min_sample_count_) {
@@ -301,6 +450,14 @@ private:
 
         const double motion_baseline_m = 2.0 * max_radius_m;
         const double snr_span = max_snr - min_snr;
+        Eigen::Matrix2d horizontal_covariance = covariance.topLeftCorner<2, 2>();
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> eigen_solver(horizontal_covariance);
+        if (eigen_solver.info() != Eigen::Success) {
+            return false;
+        }
+        const double smallest = std::max(0.0, eigen_solver.eigenvalues().x());
+        const double largest = std::max(1.0e-12, eigen_solver.eigenvalues().y());
+        trajectory_coverage_ratio_ = std::clamp(smallest / largest, 0.0, 1.0);
         // 관측 가능성 검사 B: 이동량과 SNR 대비가 잡음 임계값보다 커야 한다.
         if (motion_baseline_m < min_motion_baseline_m_ || snr_span < min_snr_span_) {
             return false;
@@ -323,6 +480,56 @@ private:
         return true;
     }
 
+    bool is_gradient_direction_stable() const
+    {
+        if (gradient_directions_.size() < gradient_stability_window_) {
+            return false;
+        }
+        Eigen::Vector2d mean = Eigen::Vector2d::Zero();
+        for (const Eigen::Vector3d & direction : gradient_directions_) {
+            mean += direction.head<2>();
+        }
+        if (mean.norm() < 1.0e-9) {
+            return false;
+        }
+        const double mean_angle = std::atan2(mean.y(), mean.x());
+        double squared_error = 0.0;
+        for (const Eigen::Vector3d & direction : gradient_directions_) {
+            double error = std::atan2(direction.y(), direction.x()) - mean_angle;
+            error = std::atan2(std::sin(error), std::cos(error));
+            squared_error += error * error;
+        }
+        const double std_rad = std::sqrt(
+            squared_error / static_cast<double>(gradient_directions_.size()));
+        return std_rad <= max_gradient_std_rad_;
+    }
+
+    bool estimate_near_source() const
+    {
+        if (samples_.size() < 2 || !particles_initialized_) {
+            return false;
+        }
+        Eigen::Vector3d cluster_center;
+        double cluster_mass = 0.0;
+        if (!estimate_dominant_particle_cluster(cluster_center, cluster_mass)) {
+            return false;
+        }
+        const double distance = (cluster_center - current_position_m_).norm();
+        const double snr_delta = std::abs(samples_.back().snr - samples_[samples_.size() - 2].snr);
+        return samples_.back().snr >= near_source_min_snr_ &&
+            distance <= near_source_distance_m_ && snr_delta <= near_source_max_snr_delta_;
+    }
+
+    void publish_estimator_status(const bool ready, const bool near_source)
+    {
+        std_msgs::msg::Bool ready_msg;
+        ready_msg.data = ready;
+        estimator_ready_pub_->publish(ready_msg);
+        std_msgs::msg::Bool near_msg;
+        near_msg.data = near_source;
+        near_source_pub_->publish(near_msg);
+    }
+
     void update_particles(const Sample & sample)
     {
         // 4-a단계: 최초 관측 위치 주변에 음원 후보 particle을 생성한다.
@@ -341,8 +548,12 @@ private:
             return;
         }
 
-        // 4-b단계: 거리 변화와 SNR 변화의 부호가 반대인 후보의 가중치를 높인다.
-        // 올바른 후보에 가까워지면 SNR이 증가해야 한다.
+        const double vehicle_motion_m = (sample.position_m - previous.position_m).norm();
+        if (vehicle_motion_m <= particle_motion_deadband_m_) {
+            return;
+        }
+
+        // 4-b단계: 부호뿐 아니라 이동 투영량과 SNR 변화량도 likelihood에 반영한다.
         for (Particle & particle : particles_) {
             const double previous_range_m = (particle.position_m - previous.position_m).norm();
             const double current_range_m = (particle.position_m - sample.position_m).norm();
@@ -351,13 +562,18 @@ private:
             if (std::abs(delta_range_m) <= particle_motion_deadband_m_) {
                 continue;
             }
-            const double agreement =
-                -(delta_range_m * delta_snr) /
-                std::max(std::abs(delta_range_m * delta_snr), 1.0e-12);
-            particle.weight *= std::exp(particle_update_gain_ * agreement);
+            const double range_evidence = std::clamp(
+                -delta_range_m / std::max(vehicle_motion_m, 1.0e-9), -1.0, 1.0);
+            const double snr_evidence = std::tanh(delta_snr / particle_snr_scale_);
+            particle.weight *= std::exp(
+                particle_update_gain_ * range_evidence * snr_evidence);
         }
 
         normalize_particle_weights();
+        last_particle_confidence_ = std::clamp(
+            1.0 - effective_particle_count() / static_cast<double>(particles_.size()),
+            0.0,
+            1.0);
         // 4-c단계: 소수 particle에 가중치가 집중되면 재표본화한다.
         if (effective_particle_count() <
             particle_resample_ess_ratio_ * static_cast<double>(particles_.size()))
@@ -436,6 +652,12 @@ private:
             }
             Particle particle = particles_[index];
             particle.weight = 1.0 / static_cast<double>(particles_.size());
+            // 복제된 particle에 작은 위치 잡음을 넣어 다양성 붕괴를 방지한다.
+            if (particle_roughening_std_m_ > 0.0) {
+                std::normal_distribution<double> noise(0.0, particle_roughening_std_m_);
+                particle.position_m.x() += noise(rng_);
+                particle.position_m.y() += noise(rng_);
+            }
             // 분기: 축소된 particle이 최소 음원 반경 안으로 들어가지 않도록 한다.
             if ((particle.position_m - current_position_m).norm() < particle_radius_min_m_) {
                 particle.position_m += random_horizontal_unit() * particle_radius_min_m_;
@@ -452,6 +674,68 @@ private:
         return Eigen::Vector3d(std::cos(angle), std::sin(angle), 0.0);
     }
 
+    void apply_particle_direction_prior(const Eigen::Vector3d & direction)
+    {
+        if (!particles_initialized_ || particles_.empty()) {
+            return;
+        }
+        Eigen::Vector3d horizontal_direction = direction;
+        horizontal_direction.z() = 0.0;
+        const double norm = horizontal_direction.norm();
+        if (norm < 1.0e-9) {
+            return;
+        }
+        horizontal_direction /= norm;
+        for (Particle & particle : particles_) {
+            Eigen::Vector3d offset = particle.position_m - current_position_m_;
+            offset.z() = 0.0;
+            const double offset_norm = offset.norm();
+            if (offset_norm > 1.0e-9) {
+                particle.weight *= std::exp(
+                    particle_prior_strength_ * horizontal_direction.dot(offset / offset_norm));
+            }
+        }
+        normalize_particle_weights();
+        particle_direction_prior_applied_ = true;
+    }
+
+    bool estimate_dominant_particle_cluster(
+        Eigen::Vector3d & center, double & cluster_mass) const
+    {
+        if (particles_.empty()) {
+            return false;
+        }
+        const double radius_sq = particle_cluster_radius_m_ * particle_cluster_radius_m_;
+        std::size_t best_seed = 0;
+        double best_mass = -1.0;
+        for (std::size_t i = 0; i < particles_.size(); ++i) {
+            double mass = 0.0;
+            for (const Particle & candidate : particles_) {
+                if ((candidate.position_m - particles_[i].position_m).squaredNorm() <= radius_sq) {
+                    mass += candidate.weight;
+                }
+            }
+            if (mass > best_mass) {
+                best_mass = mass;
+                best_seed = i;
+            }
+        }
+
+        center = Eigen::Vector3d::Zero();
+        cluster_mass = 0.0;
+        for (const Particle & particle : particles_) {
+            if ((particle.position_m - particles_[best_seed].position_m).squaredNorm() <= radius_sq) {
+                center += particle.weight * particle.position_m;
+                cluster_mass += particle.weight;
+            }
+        }
+        if (cluster_mass <= 0.0) {
+            return false;
+        }
+        center /= cluster_mass;
+        return true;
+    }
+
     bool estimate_particle_direction(Eigen::Vector3d & direction, double & confidence) const
     {
         // 분기: 사전분포가 초기화되기 전에는 PF 방향을 계산할 수 없다.
@@ -459,10 +743,11 @@ private:
             return false;
         }
 
-        // particle의 가중 중심을 현재 음원 위치 추정값으로 사용한다.
-        Eigen::Vector3d mean_source = Eigen::Vector3d::Zero();
-        for (const Particle & particle : particles_) {
-            mean_source += particle.weight * particle.position_m;
+        // 전체 평균 대신 가장 큰 국소 cluster를 사용해 다봉분포의 허위 중간점을 피한다.
+        Eigen::Vector3d mean_source;
+        double cluster_mass = 0.0;
+        if (!estimate_dominant_particle_cluster(mean_source, cluster_mass)) {
+            return false;
         }
         Eigen::Vector3d vector_to_source = mean_source - current_position_m_;
         if (horizontal_only_) {
@@ -475,11 +760,8 @@ private:
         }
 
         direction = vector_to_source / norm;
-        confidence = std::clamp(
-            effective_particle_count() / static_cast<double>(particles_.size()),
-            0.0,
-            1.0);
-        confidence = 1.0 - confidence;
+        // resampling 직후 ESS가 초기화되어도 직전 집중도와 cluster 질량을 보존한다.
+        confidence = std::clamp(cluster_mass * (0.5 + 0.5 * last_particle_confidence_), 0.0, 1.0);
         return true;
     }
 
@@ -547,9 +829,10 @@ private:
         if (!particles_initialized_ || particles_.empty()) {
             return;
         }
-        Eigen::Vector3d mean_source = Eigen::Vector3d::Zero();
-        for (const Particle & particle : particles_) {
-            mean_source += particle.weight * particle.position_m;
+        Eigen::Vector3d mean_source;
+        double cluster_mass = 0.0;
+        if (!estimate_dominant_particle_cluster(mean_source, cluster_mass)) {
+            return;
         }
 
         geometry_msgs::msg::PointStamped msg;
@@ -574,6 +857,9 @@ private:
     std::string direction_topic_;
     std::string confidence_topic_;
     std::string source_estimate_topic_;
+    std::string estimator_ready_topic_;
+    std::string near_source_topic_;
+    std::string reset_topic_;
     std::string output_frame_;
     std::string output_frame_id_;
     bool use_depth_pose_ = true;
@@ -588,6 +874,15 @@ private:
     double snr_deadband_ = 0.02;
     double direction_filter_alpha_ = 0.25;
     double covariance_regularization_ = 1.0e-4;
+    double min_trajectory_coverage_ratio_ = 0.12;
+    std::size_t gradient_stability_window_ = 8;
+    double max_gradient_std_rad_ = 0.30;
+    std::size_t snr_median_window_ = 5;
+    double odometry_history_age_s_ = 10.0;
+    double max_odometry_extrapolation_s_ = 0.10;
+    double near_source_distance_m_ = 1.0;
+    double near_source_min_snr_ = 5.0;
+    double near_source_max_snr_delta_ = 0.10;
 
     bool enable_particle_filter_ = true;
     std::string direction_source_ = "blend";
@@ -598,6 +893,10 @@ private:
     double particle_resample_ess_ratio_ = 0.45;
     double particle_blend_ = 0.35;
     double particle_motion_deadband_m_ = 0.02;
+    double particle_snr_scale_ = 0.5;
+    double particle_roughening_std_m_ = 0.20;
+    double particle_cluster_radius_m_ = 2.0;
+    double particle_prior_strength_ = 2.0;
     bool require_particle_agreement_ = false;
     double particle_agreement_min_dot_ = 0.0;
 
@@ -608,18 +907,27 @@ private:
     bool have_depth_ = false;
 
     std::deque<Sample> samples_;
+    std::deque<PoseSample> odometry_history_;
+    std::deque<double> snr_median_buffer_;
+    std::deque<Eigen::Vector3d> gradient_directions_;
+    double trajectory_coverage_ratio_ = 0.0;
     std::vector<Particle> particles_;
     bool particles_initialized_ = false;
+    bool particle_direction_prior_applied_ = false;
+    double last_particle_confidence_ = 0.0;
     std::mt19937 rng_;
     Eigen::Vector3d filtered_direction_{1.0, 0.0, 0.0};
     bool have_filtered_direction_ = false;
 
-    rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr snr_sub_;
+    rclcpp::Subscription<audio_common_msgs::msg::Float64Stamped>::SharedPtr snr_sub_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odometry_sub_;
     rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr depth_sub_;
     rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr direction_pub_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr confidence_pub_;
     rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr source_estimate_pub_;
+    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr estimator_ready_pub_;
+    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr near_source_pub_;
+    rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr reset_sub_;
 };
 }
 

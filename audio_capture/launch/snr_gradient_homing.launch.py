@@ -19,8 +19,8 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "output_frame",
-                default_value="odom",
-                description="Use 'odom' with homing_controller, or 'base_link' with simple_homing_controller.",
+                default_value="base_link",
+                description="Direction output frame; base_link is the safe controller-compatible default.",
             ),
             DeclareLaunchArgument(
                 "direction_source",

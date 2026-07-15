@@ -12,6 +12,7 @@
 #include <thread>
 
 #include <audio_common_msgs/msg/audio_data.hpp>
+#include <audio_common_msgs/msg/float64_stamped.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <geometry_msgs/msg/vector3_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
@@ -46,6 +47,9 @@ public:
             this->create_publisher<std_msgs::msg::Float64>("/audio_phase_estimator/demodulation_frequency_hz", 10);
         iq_snr_ratio_pub_ =
             this->create_publisher<std_msgs::msg::Float64>("/audio_phase_estimator/iq_snr_ratio", 10);
+        iq_snr_ratio_stamped_pub_ =
+            this->create_publisher<audio_common_msgs::msg::Float64Stamped>(
+                "/audio_phase_estimator/iq_snr_ratio_stamped", 10);
         iq_coherence_pub_ =
             this->create_publisher<std_msgs::msg::Float64>("/audio_phase_estimator/iq_coherence", 10);
         reference_frequency_hz_ =
@@ -347,7 +351,7 @@ private:
         const std::complex<double> iq = demodulate_iq(window, window_start_sample, demodulation_frequency_hz_);//Z_k = x[n] * exp(-j 2*pi*f_demod*t)
         const IqQuality iq_quality =
             estimate_iq_quality(window, window_start_sample, demodulation_frequency_hz_, iq);
-        publish_iq_quality_debug(iq_quality);
+        publish_iq_quality_debug(iq_quality, window_center_stamp);
         if (iq_quality.magnitude < min_iq_magnitude_) {
             have_previous_iq_ = false;
             reset_homing_accumulator();
@@ -643,11 +647,17 @@ private:
         return static_cast<int32_t>(raw);
     }
 
-    void publish_iq_quality_debug(const IqQuality & iq_quality)
+    void publish_iq_quality_debug(
+        const IqQuality & iq_quality, const rclcpp::Time & measurement_stamp)
     {
         std_msgs::msg::Float64 snr_ratio_msg;
         snr_ratio_msg.data = iq_quality.snr_ratio;
         iq_snr_ratio_pub_->publish(snr_ratio_msg);
+
+        audio_common_msgs::msg::Float64Stamped stamped_msg;
+        stamped_msg.header.stamp = measurement_stamp;
+        stamped_msg.data = iq_quality.snr_ratio;
+        iq_snr_ratio_stamped_pub_->publish(stamped_msg);
 
         std_msgs::msg::Float64 coherence_msg;
         coherence_msg.data = iq_quality.coherence;
@@ -779,6 +789,7 @@ private:
     rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr homing_direction_pub_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr demodulation_frequency_pub_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr iq_snr_ratio_pub_;
+    rclcpp::Publisher<audio_common_msgs::msg::Float64Stamped>::SharedPtr iq_snr_ratio_stamped_pub_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr iq_coherence_pub_;
 
     std::vector<TimedSample> sample_buffer_;
