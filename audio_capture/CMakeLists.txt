@@ -20,8 +20,11 @@ find_package(Boost REQUIRED COMPONENTS thread)
 # 2. add_executable 대신 add_library(... SHARED)를 사용해 공유 라이브러리로 빌드합니다.
 add_library(${PROJECT_NAME} SHARED
   src/audio_capture_node.cpp
+  src/audio_doppler_homing_node.cpp
   src/audio_frequency_detector.cpp
   src/audio_phase_estimator.cpp
+  src/snr_gradient_homing_node.cpp
+  src/snr_gradient_homing_controller_node.cpp
   src/homing_controller_node.cpp
   src/simple_homing_controller_node.cpp
   src/fft_node.cpp
@@ -78,8 +81,26 @@ rclcpp_components_register_node(
 
 rclcpp_components_register_node(
   ${PROJECT_NAME}
+  PLUGIN "audio_capture::AudioDopplerHomingNode"
+  EXECUTABLE audio_doppler_homing
+)
+
+rclcpp_components_register_node(
+  ${PROJECT_NAME}
   PLUGIN "audio_capture::AudioPhaseEstimatorNode"
   EXECUTABLE audio_phase_estimator
+)
+
+rclcpp_components_register_node(
+  ${PROJECT_NAME}
+  PLUGIN "audio_capture::SnrGradientHomingNode"
+  EXECUTABLE snr_gradient_homing
+)
+
+rclcpp_components_register_node(
+  ${PROJECT_NAME}
+  PLUGIN "audio_capture::SnrGradientHomingControllerNode"
+  EXECUTABLE snr_gradient_homing_controller
 )
 
 rclcpp_components_register_node(
@@ -104,8 +125,11 @@ rclcpp_components_register_node(
 install(TARGETS 
   ${PROJECT_NAME} 
   audio_capture_node
+  audio_doppler_homing
   audio_frequency_detector
   audio_phase_estimator
+  snr_gradient_homing
+  snr_gradient_homing_controller
   homing_controller
   simple_homing_controller
   fft_node

@@ -29,7 +29,7 @@ public:
     : Node("audio_phase_estimator", options)
     {
         audio_sub_ = this->create_subscription<audio_common_msgs::msg::AudioData>(
-            "/audio_boosted",
+            "/audio",
             10,
             std::bind(&AudioPhaseEstimatorNode::audio_callback, this, std::placeholders::_1));
         dvl_odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
@@ -42,29 +42,37 @@ public:
             std::bind(&AudioPhaseEstimatorNode::depth_pose_callback, this, std::placeholders::_1));
         homing_direction_pub_ =
             this->create_publisher<geometry_msgs::msg::Vector3Stamped>("/homing/direction", 10);
-        delta_phase_pub_ =
-            this->create_publisher<std_msgs::msg::Float64>("/audio_phase_estimator/delta_phase_rad", 10);
-        delta_range_pub_ =
-            this->create_publisher<std_msgs::msg::Float64>("/audio_phase_estimator/delta_range_m", 10);
-        iq_magnitude_pub_ =
-            this->create_publisher<std_msgs::msg::Float64>("/audio_phase_estimator/iq_magnitude", 10);
-        observed_frequency_offset_pub_ =
-            this->create_publisher<std_msgs::msg::Float64>("/audio_phase_estimator/observed_frequency_offset_hz", 10);
         demodulation_frequency_pub_ =
             this->create_publisher<std_msgs::msg::Float64>("/audio_phase_estimator/demodulation_frequency_hz", 10);
-        homing_bias_range_rate_pub_ =
-            this->create_publisher<std_msgs::msg::Float64>("/audio_phase_estimator/homing_bias_range_rate_mps", 10);
-        homing_bias_frequency_pub_ =
-            this->create_publisher<std_msgs::msg::Float64>("/audio_phase_estimator/homing_bias_frequency_hz", 10);
+        iq_snr_ratio_pub_ =
+            this->create_publisher<std_msgs::msg::Float64>("/audio_phase_estimator/iq_snr_ratio", 10);
+        iq_coherence_pub_ =
+            this->create_publisher<std_msgs::msg::Float64>("/audio_phase_estimator/iq_coherence", 10);
         reference_frequency_hz_ =
             this->declare_parameter<double>("reference_frequency_hz", reference_frequency_hz_);
         demodulation_frequency_hz_ = this->declare_parameter<double>(
             "initial_demodulation_frequency_hz",
             reference_frequency_hz_);
         sound_speed_mps_ = this->declare_parameter<double>("sound_speed_mps", sound_speed_mps_);
+        const int window_size_param = static_cast<int>(
+            this->declare_parameter<int>("window_size", static_cast<int>(window_size_)));
+        window_size_ = static_cast<std::size_t>(std::max(1, window_size_param));
+        const int hop_size_param = static_cast<int>(
+            this->declare_parameter<int>("hop_size", static_cast<int>(hop_size_)));
+        hop_size_ = static_cast<std::size_t>(std::max(1, hop_size_param));
+        hop_size_ = std::min(hop_size_, window_size_);
         sync_delay_s_ = this->declare_parameter<double>("sync_delay_s", 0.10);
         min_iq_magnitude_ = this->declare_parameter<double>("min_iq_magnitude", 1.0e-5);
+        min_iq_snr_ratio_ = this->declare_parameter<double>("min_iq_snr_ratio", min_iq_snr_ratio_);
+        min_iq_coherence_ = this->declare_parameter<double>("min_iq_coherence", min_iq_coherence_);
+        const int coherence_segments_param = static_cast<int>(
+            this->declare_parameter<int>("coherence_segments", static_cast<int>(coherence_segments_)));
+        coherence_segments_ = static_cast<std::size_t>(std::max(1, coherence_segments_param));
         direction_filter_alpha_ = this->declare_parameter<double>("direction_filter_alpha", 0.12);
+        homing_accumulation_time_s_ =
+            this->declare_parameter<double>("homing_accumulation_time_s", homing_accumulation_time_s_);
+        publish_homing_direction_ =
+            this->declare_parameter<bool>("publish_homing_direction", publish_homing_direction_);
         enable_frequency_acquisition_ =
             this->declare_parameter<bool>("enable_frequency_acquisition", enable_frequency_acquisition_);
         frequency_search_half_width_hz_ = this->declare_parameter<double>(
@@ -76,6 +84,14 @@ public:
         frequency_reacquire_threshold_hz_ = this->declare_parameter<double>(
             "frequency_reacquire_threshold_hz",
             frequency_reacquire_threshold_hz_);
+        const int frequency_lock_required_windows_param = static_cast<int>(
+            this->declare_parameter<int>(
+                "frequency_lock_required_windows",
+                frequency_lock_required_windows_));
+        frequency_lock_required_windows_ = std::max(1, frequency_lock_required_windows_param);
+        frequency_lock_tolerance_hz_ = this->declare_parameter<double>(
+            "frequency_lock_tolerance_hz",
+            frequency_lock_tolerance_hz_);
 
         worker_thread_ = std::thread(&AudioPhaseEstimatorNode::analysis_loop, this);
     }
@@ -141,11 +157,6 @@ private:
             return direction / norm;
         }
 
-        double bias_range_rate_mps() const
-        {
-            return state_(3);
-        }
-
     private:
         void normalize_direction_state()
         {
@@ -184,6 +195,14 @@ private:
     {
         rclcpp::Time stamp;
         double value = 0.0;
+    };
+
+    struct IqQuality
+    {
+        double magnitude = 0.0;
+        double noise_magnitude = 0.0;
+        double snr_ratio = 0.0;
+        double coherence = 0.0;
     };
 
     void audio_callback(const audio_common_msgs::msg::AudioData::ConstSharedPtr msg)
@@ -292,9 +311,9 @@ private:
                 for (std::size_t i = 0; i < window_size_; ++i) {
                     window.push_back(sample_buffer_[i].value);
                 }
-                sample_buffer_.erase(sample_buffer_.begin(), sample_buffer_.begin() + window_size_);
+                sample_buffer_.erase(sample_buffer_.begin(), sample_buffer_.begin() + hop_size_);
                 window_start_sample = next_window_start_sample_;
-                next_window_start_sample_ += window_size_;
+                next_window_start_sample_ += hop_size_;
             }
 
             analyze_window(window, window_start_sample, window_start_stamp);
@@ -318,11 +337,33 @@ private:
             window_start_stamp + rclcpp::Duration::from_seconds(0.5 * window_duration.seconds());
 
         update_demodulation_frequency(window, window_start_sample);
+        if (enable_frequency_acquisition_ && !have_frequency_lock_) {
+            have_previous_iq_ = false;
+            reset_homing_accumulator();
+            return;
+        }
 
         // coarse lock된 주파수로 복조해 baseband 복소값 z_k = I + jQ를 얻는다.
         const std::complex<double> iq = demodulate_iq(window, window_start_sample, demodulation_frequency_hz_);//Z_k = x[n] * exp(-j 2*pi*f_demod*t)
-        if (std::abs(iq) < min_iq_magnitude_) {
+        const IqQuality iq_quality =
+            estimate_iq_quality(window, window_start_sample, demodulation_frequency_hz_, iq);
+        publish_iq_quality_debug(iq_quality);
+        if (iq_quality.magnitude < min_iq_magnitude_) {
             have_previous_iq_ = false;
+            reset_homing_accumulator();
+            return;
+        }
+        if (iq_quality.snr_ratio < min_iq_snr_ratio_ || iq_quality.coherence < min_iq_coherence_) {
+            RCLCPP_WARN_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                1000,
+                "phase update skipped: weak IQ quality, |z| %.6f, snr %.2f, coherence %.2f",
+                iq_quality.magnitude,
+                iq_quality.snr_ratio,
+                iq_quality.coherence);
+            have_previous_iq_ = false;
+            reset_homing_accumulator();
             return;
         }
 
@@ -337,15 +378,8 @@ private:
             // 두 window의 켤레곱을 쓰면 -pi~pi 범위의 안정적인 위상차를 바로 얻을 수 있다.
             const std::complex<double> phase_step = iq * std::conj(previous_iq_);//Z_k * Z_k-1^*
             delta_phase_rad = std::atan2(std::imag(phase_step), std::real(phase_step));
-            const double observed_frequency_offset_hz =
-                delta_phase_rad / (2.0 * M_PI * std::max(delta_time_s, 1.0e-6));
             delta_range_m = -current_wavelength_m() * delta_phase_rad / (2.0 * M_PI);
-            publish_phase_debug(
-                delta_phase_rad,
-                delta_range_m,
-                observed_frequency_offset_hz,
-                std::abs(iq));
-            update_homing_estimate(
+            accumulate_homing_observation(
                 delta_range_m,
                 delta_time_s,
                 previous_iq_stamp_,
@@ -381,6 +415,85 @@ private:
         return baseband_sum / std::max(weight_sum, 1.0e-12);
     }
 
+    std::complex<double> demodulate_iq_segment(
+        const std::vector<double> & window,
+        const std::uint64_t window_start_sample,
+        const std::size_t offset,
+        const std::size_t count,
+        const double frequency_hz) const
+    {
+        std::complex<double> baseband_sum(0.0, 0.0);
+        const double phase_step = 2.0 * M_PI * frequency_hz / static_cast<double>(sampling_rate_);
+        const std::size_t end = std::min(window.size(), offset + count);
+        for (std::size_t n = offset; n < end; ++n) {
+            const double phase = phase_step * static_cast<double>(window_start_sample + n);
+            baseband_sum += window[n] * std::complex<double>(std::cos(phase), -std::sin(phase));
+        }
+        const std::size_t used_count = end > offset ? end - offset : 0;
+        if (used_count == 0) {
+            return {0.0, 0.0};
+        }
+        return baseband_sum / static_cast<double>(used_count);
+    }
+
+    double estimate_iq_coherence(
+        const std::vector<double> & window,
+        const std::uint64_t window_start_sample,
+        const double frequency_hz) const
+    {
+        const std::size_t segments = std::max<std::size_t>(1, std::min(coherence_segments_, window.size()));
+        const std::size_t segment_size = std::max<std::size_t>(1, window.size() / segments);
+        std::complex<double> vector_sum(0.0, 0.0);
+        double magnitude_sum = 0.0;
+
+        for (std::size_t segment = 0; segment < segments; ++segment) {
+            const std::size_t offset = segment * segment_size;
+            if (offset >= window.size()) {
+                break;
+            }
+            const std::size_t count = segment == segments - 1 ? window.size() - offset : segment_size;
+            const std::complex<double> segment_iq =
+                demodulate_iq_segment(window, window_start_sample, offset, count, frequency_hz);
+            vector_sum += segment_iq;
+            magnitude_sum += std::abs(segment_iq);
+        }
+
+        if (magnitude_sum <= 1.0e-12) {
+            return 0.0;
+        }
+        return std::clamp(std::abs(vector_sum) / magnitude_sum, 0.0, 1.0);
+    }
+
+    IqQuality estimate_iq_quality(
+        const std::vector<double> & window,
+        const std::uint64_t window_start_sample,
+        const double frequency_hz,
+        const std::complex<double> & target_iq) const
+    {
+        IqQuality quality;
+        quality.magnitude = std::abs(target_iq);
+
+        std::vector<double> noise_magnitudes;
+        noise_magnitudes.reserve(6);
+        const double offsets_hz[] = {-700.0, -450.0, -250.0, 250.0, 450.0, 700.0};
+        for (const double offset_hz : offsets_hz) {
+            const double probe_frequency_hz = frequency_hz + offset_hz;
+            if (probe_frequency_hz <= 1.0) {
+                continue;
+            }
+            noise_magnitudes.push_back(
+                std::abs(demodulate_iq(window, window_start_sample, probe_frequency_hz)));
+        }
+
+        if (!noise_magnitudes.empty()) {
+            std::sort(noise_magnitudes.begin(), noise_magnitudes.end());
+            quality.noise_magnitude = noise_magnitudes[noise_magnitudes.size() / 2];
+        }
+        quality.snr_ratio = quality.magnitude / std::max(quality.noise_magnitude, 1.0e-12);
+        quality.coherence = estimate_iq_coherence(window, window_start_sample, frequency_hz);
+        return quality;
+    }
+
     double current_wavelength_m() const
     {
         return sound_speed_mps_ / std::max(demodulation_frequency_hz_, 1.0);
@@ -399,10 +512,33 @@ private:
             return;
         }
 
+        if (pending_frequency_count_ == 0 ||
+            std::abs(acquired_frequency_hz - pending_frequency_hz_) > frequency_lock_tolerance_hz_)
+        {
+            pending_frequency_hz_ = acquired_frequency_hz;
+            pending_frequency_count_ = 1;
+        } else {
+            ++pending_frequency_count_;
+        }
+
+        if (pending_frequency_count_ < frequency_lock_required_windows_) {
+            RCLCPP_INFO_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                1000,
+                "frequency lock pending: %.3f Hz (%d/%d)",
+                pending_frequency_hz_,
+                pending_frequency_count_,
+                frequency_lock_required_windows_);
+            return;
+        }
+
+        acquired_frequency_hz = pending_frequency_hz_;
         const double frequency_step_hz = acquired_frequency_hz - demodulation_frequency_hz_;
         if (std::abs(frequency_step_hz) < frequency_reacquire_threshold_hz_) {
             demodulation_frequency_hz_ = acquired_frequency_hz;
             have_frequency_lock_ = true;
+            publish_demodulation_frequency_debug();
             RCLCPP_WARN(
                 this->get_logger(),
                 "Acquired demodulation frequency %.3f Hz.",
@@ -413,6 +549,7 @@ private:
         demodulation_frequency_hz_ = acquired_frequency_hz;
         have_frequency_lock_ = true;
         have_previous_iq_ = false;
+        publish_demodulation_frequency_debug();
         RCLCPP_WARN(
             this->get_logger(),
             "Acquired demodulation frequency %.3f Hz; phase tracking reset.",
@@ -422,7 +559,7 @@ private:
     bool estimate_peak_frequency_hz(
         const std::vector<double> & window,
         const std::uint64_t window_start_sample,
-        double & peak_frequency_hz) const
+        double & peak_frequency_hz)
     {
         if (frequency_search_half_width_hz_ <= 0.0 || frequency_search_step_hz_ <= 0.0) {
             return false;
@@ -446,6 +583,23 @@ private:
         }
 
         if (best_magnitude < min_iq_magnitude_) {
+            return false;
+        }
+
+        const std::complex<double> best_iq =
+            demodulate_iq(window, window_start_sample, best_frequency_hz);
+        const IqQuality quality =
+            estimate_iq_quality(window, window_start_sample, best_frequency_hz, best_iq);
+        if (quality.snr_ratio < min_iq_snr_ratio_ || quality.coherence < min_iq_coherence_) {
+            RCLCPP_WARN_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                1000,
+                "frequency candidate rejected: %.3f Hz, |z| %.6f, snr %.2f, coherence %.2f",
+                best_frequency_hz,
+                quality.magnitude,
+                quality.snr_ratio,
+                quality.coherence);
             return false;
         }
 
@@ -489,31 +643,66 @@ private:
         return static_cast<int32_t>(raw);
     }
 
-    void publish_phase_debug(
-        const double delta_phase_rad,
-        const double delta_range_m,
-        const double observed_frequency_offset_hz,
-        const double iq_magnitude)
+    void publish_iq_quality_debug(const IqQuality & iq_quality)
     {
-        std_msgs::msg::Float64 delta_phase_msg;
-        delta_phase_msg.data = delta_phase_rad;
-        delta_phase_pub_->publish(delta_phase_msg);
+        std_msgs::msg::Float64 snr_ratio_msg;
+        snr_ratio_msg.data = iq_quality.snr_ratio;
+        iq_snr_ratio_pub_->publish(snr_ratio_msg);
 
-        std_msgs::msg::Float64 delta_range_msg;
-        delta_range_msg.data = delta_range_m;
-        delta_range_pub_->publish(delta_range_msg);
+        std_msgs::msg::Float64 coherence_msg;
+        coherence_msg.data = iq_quality.coherence;
+        iq_coherence_pub_->publish(coherence_msg);
+    }
 
-        std_msgs::msg::Float64 iq_magnitude_msg;
-        iq_magnitude_msg.data = iq_magnitude;
-        iq_magnitude_pub_->publish(iq_magnitude_msg);
-
-        std_msgs::msg::Float64 observed_offset_msg;
-        observed_offset_msg.data = observed_frequency_offset_hz;
-        observed_frequency_offset_pub_->publish(observed_offset_msg);
-
+    void publish_demodulation_frequency_debug()
+    {
         std_msgs::msg::Float64 demodulation_frequency_msg;
         demodulation_frequency_msg.data = demodulation_frequency_hz_;
         demodulation_frequency_pub_->publish(demodulation_frequency_msg);
+    }
+
+    void accumulate_homing_observation(
+        const double delta_range_m,
+        const double delta_time_s,
+        const rclcpp::Time & step_start_stamp,
+        const rclcpp::Time & step_end_stamp)
+    {
+        if (delta_time_s <= 0.0) {
+            reset_homing_accumulator();
+            return;
+        }
+
+        if (!have_homing_accumulator_) {
+            accumulated_homing_start_stamp_ = step_start_stamp;
+            accumulated_homing_delta_range_m_ = 0.0;
+            accumulated_homing_delta_time_s_ = 0.0;
+            accumulated_homing_step_count_ = 0;
+            have_homing_accumulator_ = true;
+        }
+
+        accumulated_homing_delta_range_m_ += delta_range_m;
+        accumulated_homing_delta_time_s_ += delta_time_s;
+        accumulated_homing_end_stamp_ = step_end_stamp;
+        ++accumulated_homing_step_count_;
+
+        if (accumulated_homing_delta_time_s_ < homing_accumulation_time_s_) {
+            return;
+        }
+
+        update_homing_estimate(
+            accumulated_homing_delta_range_m_,
+            accumulated_homing_delta_time_s_,
+            accumulated_homing_start_stamp_,
+            accumulated_homing_end_stamp_);
+        reset_homing_accumulator();
+    }
+
+    void reset_homing_accumulator()
+    {
+        have_homing_accumulator_ = false;
+        accumulated_homing_delta_range_m_ = 0.0;
+        accumulated_homing_delta_time_s_ = 0.0;
+        accumulated_homing_step_count_ = 0;
     }
 
     void update_homing_estimate(
@@ -533,7 +722,7 @@ private:
                     this->get_logger(),
                     *this->get_clock(),
                     1000,
-                    "homing update skipped: receive-time odometry/depth buffer does not cover audio window [%.6f, %.6f]",
+                    "homing update skipped: receive-time odometry/depth buffer does not cover homing segment [%.6f, %.6f]",
                     window_start_stamp.seconds(),
                     window_end_stamp.seconds());
                 return;
@@ -543,7 +732,6 @@ private:
         const Eigen::Vector3d delta_position_m = end_position_m - start_position_m;
         const bool direction_observable =
             homing_direction_ekf_.update(delta_position_m, delta_range_m, delta_time_s);
-        publish_homing_bias_debug();
         if (!direction_observable) {
             return;
         }
@@ -553,6 +741,9 @@ private:
             return;
         }
         const Eigen::Vector3d filtered_direction = filter_direction(direction);
+        if (!publish_homing_direction_) {
+            return;
+        }
 
         geometry_msgs::msg::Vector3Stamped direction_msg;
         direction_msg.header.stamp = this->now();
@@ -561,19 +752,6 @@ private:
         direction_msg.vector.y = filtered_direction.y();
         direction_msg.vector.z = filtered_direction.z();
         homing_direction_pub_->publish(direction_msg);
-    }
-
-    void publish_homing_bias_debug()
-    {
-        const double bias_range_rate_mps = homing_direction_ekf_.bias_range_rate_mps();
-
-        std_msgs::msg::Float64 bias_range_rate_msg;
-        bias_range_rate_msg.data = bias_range_rate_mps;
-        homing_bias_range_rate_pub_->publish(bias_range_rate_msg);
-
-        std_msgs::msg::Float64 bias_frequency_msg;
-        bias_frequency_msg.data = -bias_range_rate_mps / current_wavelength_m();
-        homing_bias_frequency_pub_->publish(bias_frequency_msg);
     }
 
     Eigen::Vector3d filter_direction(const Eigen::Vector3d & direction)
@@ -599,13 +777,9 @@ private:
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr dvl_odom_sub_;
     rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr depth_pose_sub_;
     rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr homing_direction_pub_;
-    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr delta_phase_pub_;
-    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr delta_range_pub_;
-    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr iq_magnitude_pub_;
-    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr observed_frequency_offset_pub_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr demodulation_frequency_pub_;
-    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr homing_bias_range_rate_pub_;
-    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr homing_bias_frequency_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr iq_snr_ratio_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr iq_coherence_pub_;
 
     std::vector<TimedSample> sample_buffer_;
     std::mutex buffer_mutex_;
@@ -619,6 +793,7 @@ private:
     std::size_t frame_size_ = channels_ * bytes_per_sample_;
 
     std::size_t window_size_ = 4096;
+    std::size_t hop_size_ = 1024;
     std::uint64_t next_window_start_sample_ = 0;
     std::size_t sampling_rate_ = 96000;
     double reference_frequency_hz_ = 21164.0; //27211.0도 있을 수 있음.
@@ -629,13 +804,28 @@ private:
     double frequency_search_half_width_hz_ = 1000.0;
     double frequency_search_step_hz_ = 10.0;
     double frequency_reacquire_threshold_hz_ = 50.0;
+    int frequency_lock_required_windows_ = 5;
+    double frequency_lock_tolerance_hz_ = 20.0;
+    double pending_frequency_hz_ = 0.0;
+    int pending_frequency_count_ = 0;
     double min_iq_magnitude_ = 1.0e-8;
+    double min_iq_snr_ratio_ = 2.0;
+    double min_iq_coherence_ = 0.25;
+    std::size_t coherence_segments_ = 8;
     double sync_delay_s_ = 0.10;
     double direction_filter_alpha_ = 0.12;
+    double homing_accumulation_time_s_ = 1.0;
+    bool publish_homing_direction_ = true;
 
     bool have_previous_iq_ = false;
     std::complex<double> previous_iq_{0.0, 0.0};
     rclcpp::Time previous_iq_stamp_;
+    bool have_homing_accumulator_ = false;
+    rclcpp::Time accumulated_homing_start_stamp_;
+    rclcpp::Time accumulated_homing_end_stamp_;
+    double accumulated_homing_delta_range_m_ = 0.0;
+    double accumulated_homing_delta_time_s_ = 0.0;
+    int accumulated_homing_step_count_ = 0;
     HomingDirectionEkf homing_direction_ekf_;
     Eigen::Vector3d filtered_direction_{1.0, 0.0, 0.0};
     bool have_filtered_direction_ = false;
