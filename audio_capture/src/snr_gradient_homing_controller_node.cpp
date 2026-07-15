@@ -4,14 +4,18 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <deque>
 #include <string>
+#include <utility>
 
+#include <Eigen/Dense>
 #include <geometry_msgs/msg/vector3_stamped.hpp>
 #include <mavros_msgs/msg/override_rc_in.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_components/register_node_macro.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/float64.hpp>
+#include <std_msgs/msg/empty.hpp>
 #include <std_msgs/msg/string.hpp>
 
 namespace audio_capture
@@ -39,6 +43,11 @@ public:
             declare_parameter<std::string>("enable_topic", "/homing/control_enable");
         state_topic_ =
             declare_parameter<std::string>("state_topic", "/homing/control_state");
+        estimator_ready_topic_ =
+            declare_parameter<std::string>("estimator_ready_topic", "/homing/estimator_ready");
+        near_source_topic_ =
+            declare_parameter<std::string>("near_source_topic", "/homing/near_source");
+        reset_topic_ = declare_parameter<std::string>("reset_topic", "/homing/reset_estimator");
         rc_override_topic_ =
             declare_parameter<std::string>("rc_override_topic", "/mavros/rc/override");
         required_direction_frame_ =
@@ -59,6 +68,11 @@ public:
             clamp(declare_parameter<double>("search_min_duration_s", 6.0), 0.0, 120.0);
         direction_loss_hold_s_ =
             clamp(declare_parameter<double>("direction_loss_hold_s", 1.0), 0.0, 30.0);
+        direction_stability_window_s_ = clamp(
+            declare_parameter<double>("direction_stability_window_s", 1.0), 0.1, 10.0);
+        max_direction_std_rad_ = clamp(
+            declare_parameter<double>("max_direction_std_rad", 0.30), 0.01, PI);
+        arrived_hold_s_ = clamp(declare_parameter<double>("arrived_hold_s", 1.0), 0.0, 30.0);
 
         // 초기/재탐색 원형 운동 설정. 부호는 실제 기체 yaw 채널 방향에 맞춘다.
         search_forward_ =
@@ -109,10 +123,17 @@ public:
                 &SnrGradientHomingControllerNode::enable_callback,
                 this,
                 std::placeholders::_1));
+        estimator_ready_sub_ = create_subscription<std_msgs::msg::Bool>(
+            estimator_ready_topic_, 10,
+            std::bind(&SnrGradientHomingControllerNode::estimator_ready_callback, this, std::placeholders::_1));
+        near_source_sub_ = create_subscription<std_msgs::msg::Bool>(
+            near_source_topic_, 10,
+            std::bind(&SnrGradientHomingControllerNode::near_source_callback, this, std::placeholders::_1));
 
         rc_pub_ = create_publisher<mavros_msgs::msg::OverrideRCIn>(rc_override_topic_, 10);
         state_pub_ = create_publisher<std_msgs::msg::String>(
             state_topic_, rclcpp::QoS(1).reliable().transient_local());
+        reset_pub_ = create_publisher<std_msgs::msg::Empty>(reset_topic_, 10);
 
         state_ = control_enabled_ ? State::INITIAL_SEARCH : State::DISABLED;
         state_enter_time_ = now();
@@ -148,7 +169,8 @@ private:
         DISABLED,
         INITIAL_SEARCH,
         HOMING,
-        REACQUIRE
+        REACQUIRE,
+        ARRIVED
     };
 
     struct Command
@@ -192,6 +214,12 @@ private:
         direction_z_ = z / norm;
         last_direction_time_ = now();
         have_direction_ = true;
+        bearing_history_.push_back({last_direction_time_, std::atan2(direction_y_, direction_x_)});
+        while (!bearing_history_.empty() &&
+            (last_direction_time_ - bearing_history_.front().first).seconds() > direction_stability_window_s_)
+        {
+            bearing_history_.pop_front();
+        }
     }
 
     void confidence_callback(const std_msgs::msg::Float64::ConstSharedPtr msg)
@@ -221,6 +249,20 @@ private:
         }
     }
 
+    void estimator_ready_callback(const std_msgs::msg::Bool::ConstSharedPtr msg)
+    {
+        estimator_ready_ = msg->data;
+        last_estimator_ready_time_ = now();
+    }
+
+    void near_source_callback(const std_msgs::msg::Bool::ConstSharedPtr msg)
+    {
+        near_source_ = msg->data;
+        if (!near_source_) {
+            have_near_source_start_ = false;
+        }
+    }
+
     void control_loop()
     {
         const rclcpp::Time current_time = now();
@@ -228,6 +270,11 @@ private:
         // 비활성 상태에서는 RC override를 해제하여 수동 조종을 방해하지 않는다.
         if (!control_enabled_ || state_ == State::DISABLED) {
             rc_pub_->publish(make_release_override());
+            return;
+        }
+
+        if (state_ == State::ARRIVED) {
+            rc_pub_->publish(make_rc_override(Command{}));
             return;
         }
 
@@ -246,6 +293,18 @@ private:
 
         // 실행 분기 B: 유효한 방향을 따라 음원 쪽으로 전진한다.
         if (state_ == State::HOMING && signal_valid) {
+            if (near_source_) {
+                if (!have_near_source_start_) {
+                    near_source_start_time_ = current_time;
+                    have_near_source_start_ = true;
+                } else if ((current_time - near_source_start_time_).seconds() >= arrived_hold_s_) {
+                    transition_to(State::ARRIVED);
+                    rc_pub_->publish(make_rc_override(Command{}));
+                    return;
+                }
+            } else {
+                have_near_source_start_ = false;
+            }
             last_valid_signal_time_ = current_time;
             have_last_valid_signal_time_ = true;
             rc_pub_->publish(make_rc_override(homing_command()));
@@ -269,7 +328,7 @@ private:
     void update_search_acquisition(const rclcpp::Time & current_time, const bool signal_valid)
     {
         // 방향이 불안정하면 연속 획득 시간을 처음부터 다시 센다.
-        if (!signal_valid) {
+        if (!signal_valid || !estimator_ready_ || !direction_is_stable()) {
             have_acquire_start_ = false;
             return;
         }
@@ -300,6 +359,25 @@ private:
             return false;
         }
         return direction_confidence_ >= min_direction_confidence_;
+    }
+
+    bool direction_is_stable() const
+    {
+        if (bearing_history_.size() < 3) {
+            return false;
+        }
+        Eigen::Vector2d mean = Eigen::Vector2d::Zero();
+        for (const auto & sample : bearing_history_) {
+            mean += Eigen::Vector2d(std::cos(sample.second), std::sin(sample.second));
+        }
+        const double mean_angle = std::atan2(mean.y(), mean.x());
+        double squared_error = 0.0;
+        for (const auto & sample : bearing_history_) {
+            const double error = wrap_pi(sample.second - mean_angle);
+            squared_error += error * error;
+        }
+        return std::sqrt(squared_error / static_cast<double>(bearing_history_.size())) <=
+            max_direction_std_rad_;
     }
 
     Command search_command() const
@@ -376,6 +454,11 @@ private:
         state_ = next_state;
         state_enter_time_ = now();
         have_acquire_start_ = false;
+        if (next_state == State::INITIAL_SEARCH || next_state == State::REACQUIRE) {
+            estimator_ready_ = false;
+            bearing_history_.clear();
+            reset_pub_->publish(std_msgs::msg::Empty{});
+        }
         publish_state();
         RCLCPP_INFO(get_logger(), "Homing control state -> %s", state_name(state_));
     }
@@ -398,6 +481,8 @@ private:
                 return "HOMING";
             case State::REACQUIRE:
                 return "REACQUIRE";
+            case State::ARRIVED:
+                return "ARRIVED";
         }
         return "UNKNOWN";
     }
@@ -431,6 +516,9 @@ private:
     std::string enable_topic_;
     std::string state_topic_;
     std::string rc_override_topic_;
+    std::string estimator_ready_topic_;
+    std::string near_source_topic_;
+    std::string reset_topic_;
     std::string required_direction_frame_;
 
     bool control_enabled_ = false;
@@ -441,6 +529,9 @@ private:
     double acquire_hold_s_ = 1.0;
     double search_min_duration_s_ = 6.0;
     double direction_loss_hold_s_ = 1.0;
+    double direction_stability_window_s_ = 1.0;
+    double max_direction_std_rad_ = 0.30;
+    double arrived_hold_s_ = 1.0;
 
     double search_forward_ = 0.30;
     double search_yaw_ = 0.30;
@@ -475,12 +566,21 @@ private:
     rclcpp::Time last_confidence_time_;
     bool have_direction_ = false;
     bool have_confidence_ = false;
+    bool estimator_ready_ = false;
+    bool near_source_ = false;
+    bool have_near_source_start_ = false;
+    rclcpp::Time near_source_start_time_;
+    rclcpp::Time last_estimator_ready_time_;
+    std::deque<std::pair<rclcpp::Time, double>> bearing_history_;
 
     rclcpp::Subscription<geometry_msgs::msg::Vector3Stamped>::SharedPtr direction_sub_;
     rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr confidence_sub_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr enable_sub_;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr estimator_ready_sub_;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr near_source_sub_;
     rclcpp::Publisher<mavros_msgs::msg::OverrideRCIn>::SharedPtr rc_pub_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr state_pub_;
+    rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr reset_pub_;
     rclcpp::TimerBase::SharedPtr timer_;
 };
 }
