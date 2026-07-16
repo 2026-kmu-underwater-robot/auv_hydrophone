@@ -12,6 +12,7 @@
 #include <thread>
 
 #include <audio_common_msgs/msg/audio_data.hpp>
+#include <audio_common_msgs/msg/audio_data_stamped.hpp>
 #include <audio_common_msgs/msg/float64_stamped.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <geometry_msgs/msg/vector3_stamped.hpp>
@@ -26,19 +27,40 @@ namespace audio_capture
 class AudioPhaseEstimatorNode : public rclcpp::Node
 {
 public:
+    // [노드 초기화] 오디오·위치 입력, 분석 파라미터, 진단 출력을 구성하고 분석 스레드를 시작한다.
     explicit AudioPhaseEstimatorNode(const rclcpp::NodeOptions & options = rclcpp::NodeOptions())
     : Node("audio_phase_estimator", options)
     {
-        audio_sub_ = this->create_subscription<audio_common_msgs::msg::AudioData>(
-            "/audio",
-            10,
-            std::bind(&AudioPhaseEstimatorNode::audio_callback, this, std::placeholders::_1));
+        audio_topic_ = this->declare_parameter<std::string>("audio_topic", "/audio");
+        audio_stamped_topic_ =
+            this->declare_parameter<std::string>("audio_stamped_topic", "/audio_stamped");
+        use_stamped_audio_ = this->declare_parameter<bool>("use_stamped_audio", false);
+        odometry_topic_ =
+            this->declare_parameter<std::string>("odometry_topic", "/odometry/filtered");
+        depth_topic_ = this->declare_parameter<std::string>("depth_topic", "/depth/pose");
+        audio_input_latency_s_ = std::max(
+            0.0, this->declare_parameter<double>("audio_input_latency_s", 0.0));
+        if (use_stamped_audio_) {
+            audio_stamped_sub_ =
+                this->create_subscription<audio_common_msgs::msg::AudioDataStamped>(
+                    audio_stamped_topic_,
+                    10,
+                    std::bind(
+                        &AudioPhaseEstimatorNode::audio_stamped_callback,
+                        this,
+                        std::placeholders::_1));
+        } else {
+            audio_sub_ = this->create_subscription<audio_common_msgs::msg::AudioData>(
+                audio_topic_,
+                10,
+                std::bind(&AudioPhaseEstimatorNode::audio_callback, this, std::placeholders::_1));
+        }
         dvl_odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-            "/odometry/filtered",
+            odometry_topic_,
             10,
             std::bind(&AudioPhaseEstimatorNode::dvl_odometry_callback, this, std::placeholders::_1));
         depth_pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
-            "/depth/pose",
+            depth_topic_,
             10,
             std::bind(&AudioPhaseEstimatorNode::depth_pose_callback, this, std::placeholders::_1));
         homing_direction_pub_ =
@@ -97,9 +119,19 @@ public:
             "frequency_lock_tolerance_hz",
             frequency_lock_tolerance_hz_);
 
+        RCLCPP_INFO(
+            get_logger(),
+            "Audio phase estimator ready. audio=%s stamped=%s odom=%s depth=%s input_latency=%.3fs",
+            use_stamped_audio_ ? audio_stamped_topic_.c_str() : audio_topic_.c_str(),
+            use_stamped_audio_ ? "true" : "false",
+            odometry_topic_.c_str(),
+            depth_topic_.c_str(),
+            audio_input_latency_s_);
+
         worker_thread_ = std::thread(&AudioPhaseEstimatorNode::analysis_loop, this);
     }
 
+    // [분석 스레드 종료] 대기 중인 worker를 깨운 뒤 join하여 노드를 안전하게 종료한다.
     ~AudioPhaseEstimatorNode()
     {
         {
@@ -119,6 +151,7 @@ private:
     class HomingDirectionEkf
     {
     public:
+        // [EKF 관측 갱신] AUV 이동량과 음원 거리 변화량으로 방향 상태와 drift bias를 보정한다.
         bool update(
             const Eigen::Vector3d & delta_position_m,
             const double delta_range_m,
@@ -151,6 +184,7 @@ private:
             return delta_position_m.squaredNorm() >= min_motion_squared_m2_;
         }
 
+        // [EKF 방향 조회] 내부 방향 상태를 단위 벡터로 반환하고 영벡터 상태는 거부한다.
         Eigen::Vector3d normalized_direction() const
         {
             const Eigen::Vector3d direction = state_.head<3>();
@@ -162,6 +196,7 @@ private:
         }
 
     private:
+        // [EKF 상태 정규화] 갱신된 방향 3축의 크기를 1로 맞춰 방향 벡터 제약을 유지한다.
         void normalize_direction_state()
         {
             Eigen::Vector3d direction = state_.head<3>();
@@ -209,16 +244,39 @@ private:
         double coherence = 0.0;
     };
 
+    // [무타임스탬프 오디오 수신] 수신 시각과 버퍼 길이로 시작 시각을 추정해 PCM 큐에 넣는다.
     void audio_callback(const audio_common_msgs::msg::AudioData::ConstSharedPtr msg)
     {
         const rclcpp::Time buffer_start_stamp = estimate_audio_buffer_start_stamp(msg->data.size());
+        append_audio_buffer(msg->data, buffer_start_stamp);
+    }
+
+    // [타임스탬프 오디오 수신] 메시지 header 시각을 우선 사용하고 0이면 수신 시각으로 대체한다.
+    void audio_stamped_callback(
+        const audio_common_msgs::msg::AudioDataStamped::ConstSharedPtr msg)
+    {
+        rclcpp::Time buffer_start_stamp(msg->header.stamp);
+        if (buffer_start_stamp.nanoseconds() <= 0) {
+            buffer_start_stamp = estimate_audio_buffer_start_stamp(msg->audio.data.size());
+            RCLCPP_WARN_THROTTLE(
+                get_logger(), *get_clock(), 2000,
+                "Stamped audio has a zero header; using receive-time fallback.");
+        }
+        append_audio_buffer(msg->audio.data, buffer_start_stamp);
+    }
+
+    // [오디오 버퍼 적재] PCM 변환을 mutex로 보호하고 분석 worker에 새 데이터 도착을 알린다.
+    void append_audio_buffer(
+        const std::vector<uint8_t> & data, const rclcpp::Time & buffer_start_stamp)
+    {
         {
             std::lock_guard<std::mutex> lock(buffer_mutex_);
-            append_samples_from_pcm(msg->data, buffer_start_stamp);
+            append_samples_from_pcm(data, buffer_start_stamp);
         }
         buffer_cv_.notify_one();
     }
 
+    // [수평 위치 수신] DVL odometry의 x·y를 시각과 함께 보관하고 오래된 버퍼를 정리한다.
     void dvl_odometry_callback(const nav_msgs::msg::Odometry::ConstSharedPtr msg)
     {
         std::lock_guard<std::mutex> lock(dvl_mutex_);
@@ -228,6 +286,7 @@ private:
         trim_old_samples(odometry_buffer_);
     }
 
+    // [수심 위치 수신] 별도 수심 토픽의 z를 시각과 함께 보관하고 오래된 버퍼를 정리한다.
     void depth_pose_callback(const geometry_msgs::msg::PoseWithCovarianceStamped::ConstSharedPtr msg)
     {
         std::lock_guard<std::mutex> lock(dvl_mutex_);
@@ -235,6 +294,7 @@ private:
         trim_old_samples(depth_buffer_);
     }
 
+    // [3차원 위치 동기화] 요청 시각의 보간 x·y와 최신 유효 z를 결합해 AUV 위치를 만든다.
     bool interpolate_position(const rclcpp::Time & stamp, Eigen::Vector3d & position_m) const
     {
         Eigen::Vector2d xy;
@@ -246,6 +306,7 @@ private:
         return true;
     }
 
+    // [수평 위치 보간] 요청 시각을 둘러싼 odometry 두 점 사이에서 x·y를 선형 보간한다.
     bool interpolate_xy(const rclcpp::Time & stamp, Eigen::Vector2d & value) const
     {
         if (odometry_buffer_.size() < 2 ||
@@ -270,6 +331,7 @@ private:
         return false;
     }
 
+    // [수심 영차 유지] 요청 시각 이전에 도착한 가장 최근 수심값을 선택한다.
     bool hold_depth(const rclcpp::Time & stamp, double & value) const
     {
         if (depth_buffer_.empty() || stamp < depth_buffer_.front().stamp) {
@@ -287,12 +349,14 @@ private:
     }
 
     template<typename SampleT>
+    // [위치 버퍼 제한] 위치·수심 이력의 최대 개수를 넘은 가장 오래된 표본을 제거한다.
     void trim_old_samples(std::deque<SampleT> & buffer) const
     {
         while (buffer.size() > max_pose_buffer_size_) {
             buffer.pop_front();
         }
     }
+    // [오디오 분석 루프] 충분한 샘플을 기다려 겹치는 window를 만들고 주기적으로 분석한다.
     void analysis_loop()
     {
         while (rclcpp::ok()) {
@@ -324,12 +388,14 @@ private:
         }
     }
 
+    // [동기화 지연 환산] 설정된 지연 시간을 현재 sampling rate 기준 샘플 개수로 바꾼다.
     std::size_t sync_delay_samples() const
     {
         return static_cast<std::size_t>(
             std::ceil(std::max(sync_delay_s_, 0.0) * static_cast<double>(sampling_rate_)));
     }
 
+    // [단일 window 분석] 주파수 lock, IQ 품질, 위상차와 거리 변화량을 순서대로 계산한다.
     void analyze_window(
         const std::vector<double> & window,
         const std::uint64_t window_start_sample,
@@ -394,6 +460,7 @@ private:
         have_previous_iq_ = true;
     }
 
+    // [전체 window IQ 복조] Hann window와 복소 혼합을 적용해 기준 주파수의 baseband 평균을 구한다.
     std::complex<double> demodulate_iq(
         const std::vector<double> & window,
         const std::uint64_t window_start_sample,
@@ -419,6 +486,7 @@ private:
         return baseband_sum / std::max(weight_sum, 1.0e-12);
     }
 
+    // [구간 IQ 복조] coherence 계산용으로 window 일부 구간의 복소 평균을 구한다.
     std::complex<double> demodulate_iq_segment(
         const std::vector<double> & window,
         const std::uint64_t window_start_sample,
@@ -440,6 +508,7 @@ private:
         return baseband_sum / static_cast<double>(used_count);
     }
 
+    // [IQ 위상 일관성 계산] 여러 구간 IQ가 같은 위상을 유지하는 정도를 0~1로 산출한다.
     double estimate_iq_coherence(
         const std::vector<double> & window,
         const std::uint64_t window_start_sample,
@@ -468,6 +537,7 @@ private:
         return std::clamp(std::abs(vector_sum) / magnitude_sum, 0.0, 1.0);
     }
 
+    // [IQ 품질 평가] target 크기, 주변 주파수 noise, SNR 비율과 coherence를 한 번에 계산한다.
     IqQuality estimate_iq_quality(
         const std::vector<double> & window,
         const std::uint64_t window_start_sample,
@@ -498,11 +568,13 @@ private:
         return quality;
     }
 
+    // [현재 파장 계산] 음속을 현재 복조 주파수로 나누어 위상차→거리 변환 파장을 반환한다.
     double current_wavelength_m() const
     {
         return sound_speed_mps_ / std::max(demodulation_frequency_hz_, 1.0);
     }
 
+    // [복조 주파수 획득] 연속 window의 peak 후보가 안정될 때 실제 복조 주파수를 lock한다.
     void update_demodulation_frequency(
         const std::vector<double> & window,
         const std::uint64_t window_start_sample)
@@ -560,6 +632,7 @@ private:
             demodulation_frequency_hz_);
     }
 
+    // [주파수 peak 탐색] 기준 주파수 주변을 훑어 IQ 품질 기준을 통과한 최대 응답을 찾는다.
     bool estimate_peak_frequency_hz(
         const std::vector<double> & window,
         const std::uint64_t window_start_sample,
@@ -611,6 +684,7 @@ private:
         return true;
     }
 
+    // [PCM 디코딩] S32LE interleaved 입력에서 선택 채널을 정규화하고 샘플별 시각을 부여한다.
     void append_samples_from_pcm(const std::vector<uint8_t> & data, const rclcpp::Time & buffer_start_stamp)
     {
         // /audio는 S32LE 2채널 interleaved PCM이므로 선택한 채널만 double 샘플로 변환한다.
@@ -629,14 +703,18 @@ private:
         }
     }
 
+    // [오디오 시작 시각 추정] 수신 시각에서 설정 latency와 버퍼 재생 시간을 빼서 PTS를 근사한다.
     rclcpp::Time estimate_audio_buffer_start_stamp(const std::size_t byte_count)
     {
         const std::size_t frame_count = byte_count / frame_size_;
         const auto buffer_duration = rclcpp::Duration::from_seconds(
             static_cast<double>(frame_count) / static_cast<double>(sampling_rate_));
-        return this->now() - buffer_duration;
+        const auto configured_latency =
+            rclcpp::Duration::from_seconds(audio_input_latency_s_);
+        return this->now() - configured_latency - buffer_duration;
     }
 
+    // [S32LE 샘플 읽기] 지정 byte offset의 4바이트 little-endian 값을 signed 32비트로 복원한다.
     int32_t read_int32_little_endian(const std::vector<uint8_t> & data, const std::size_t offset) const
     {
         const uint32_t raw =
@@ -647,6 +725,7 @@ private:
         return static_cast<int32_t>(raw);
     }
 
+    // [IQ 진단 발행] SNR, stamped SNR, coherence 토픽을 동일 분석 결과로 발행한다.
     void publish_iq_quality_debug(
         const IqQuality & iq_quality, const rclcpp::Time & measurement_stamp)
     {
@@ -664,6 +743,7 @@ private:
         iq_coherence_pub_->publish(coherence_msg);
     }
 
+    // [복조 주파수 진단 발행] 현재 lock된 복조 주파수를 모니터링 토픽으로 내보낸다.
     void publish_demodulation_frequency_debug()
     {
         std_msgs::msg::Float64 demodulation_frequency_msg;
@@ -671,6 +751,7 @@ private:
         demodulation_frequency_pub_->publish(demodulation_frequency_msg);
     }
 
+    // [위상 관측 누적] 짧은 window별 거리 변화를 설정 시간만큼 합쳐 EKF 갱신 구간을 만든다.
     void accumulate_homing_observation(
         const double delta_range_m,
         const double delta_time_s,
@@ -707,6 +788,7 @@ private:
         reset_homing_accumulator();
     }
 
+    // [위상 관측 초기화] 누적 거리·시간·window 수를 지워 다음 homing 구간을 준비한다.
     void reset_homing_accumulator()
     {
         have_homing_accumulator_ = false;
@@ -715,6 +797,7 @@ private:
         accumulated_homing_step_count_ = 0;
     }
 
+    // [위상 기반 방향 갱신] 구간 양끝 위치와 누적 거리 변화로 EKF 방향을 계산해 선택적으로 발행한다.
     void update_homing_estimate(
         const double delta_range_m,
         const double delta_time_s,
@@ -764,6 +847,7 @@ private:
         homing_direction_pub_->publish(direction_msg);
     }
 
+    // [방향 저역통과 필터] 이전 결과와 새 단위 벡터를 혼합하고 다시 정규화한다.
     Eigen::Vector3d filter_direction(const Eigen::Vector3d & direction)
     {
         const double alpha = std::clamp(direction_filter_alpha_, 0.0, 1.0);
@@ -783,7 +867,15 @@ private:
         return filtered_direction_;
     }
 
+    std::string audio_topic_ = "/audio";
+    std::string audio_stamped_topic_ = "/audio_stamped";
+    std::string odometry_topic_ = "/odometry/filtered";
+    std::string depth_topic_ = "/depth/pose";
+    bool use_stamped_audio_ = false;
+    double audio_input_latency_s_ = 0.0;
+
     rclcpp::Subscription<audio_common_msgs::msg::AudioData>::SharedPtr audio_sub_;
+    rclcpp::Subscription<audio_common_msgs::msg::AudioDataStamped>::SharedPtr audio_stamped_sub_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr dvl_odom_sub_;
     rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr depth_pose_sub_;
     rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr homing_direction_pub_;

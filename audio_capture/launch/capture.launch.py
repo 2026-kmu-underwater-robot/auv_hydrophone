@@ -4,6 +4,7 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
+# [오디오 캡처 launch 구성] 캡처 노드 실행 인자와 raw/stamped 오디오 remap을 정의한다.
 def generate_launch_description():
     _src = LaunchConfiguration('src')
     _dst = LaunchConfiguration('dst')
@@ -16,6 +17,7 @@ def generate_launch_description():
     _sample_format = LaunchConfiguration('sample_format')
     _ns = LaunchConfiguration('ns')
     _audio_topic = LaunchConfiguration('audio_topic')
+    _audio_stamped_topic = LaunchConfiguration('audio_stamped_topic')
 
     _src_launch_arg = DeclareLaunchArgument(
         'src',
@@ -59,7 +61,11 @@ def generate_launch_description():
     )
     _audio_topic_launch_arg = DeclareLaunchArgument(
         'audio_topic',
-        default_value='audio'
+        default_value='/audio'
+    )
+    _audio_stamped_topic_launch_arg = DeclareLaunchArgument(
+        'audio_stamped_topic',
+        default_value='/audio_stamped'
     )
 
     _audio_capture_node = Node(
@@ -69,6 +75,7 @@ def generate_launch_description():
         namespace=_ns,
         remappings=[
             ('audio', _audio_topic),
+            ('audio_stamped', _audio_stamped_topic),
         ],
         parameters=[{
             'src': _src,
@@ -95,5 +102,6 @@ def generate_launch_description():
         _sample_format_launch_arg,
         _ns_launch_arg,
         _audio_topic_launch_arg,
+        _audio_stamped_topic_launch_arg,
         _audio_capture_node,
     ])

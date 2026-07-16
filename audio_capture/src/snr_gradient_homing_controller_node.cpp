@@ -11,6 +11,7 @@
 #include <Eigen/Dense>
 #include <geometry_msgs/msg/vector3_stamped.hpp>
 #include <mavros_msgs/msg/override_rc_in.hpp>
+#include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_components/register_node_macro.hpp>
 #include <std_msgs/msg/bool.hpp>
@@ -23,6 +24,7 @@ namespace audio_capture
 // SNR gradient 전용 제어 흐름:
 //   DISABLED
 //      enable=true
+//          -> INITIAL_DIAGONAL: 모서리에서 경기장 중심 방향으로 대각선 이동
 //          -> INITIAL_SEARCH: 전진+yaw 명령으로 원형/호 궤적 생성
 //          -> HOMING: 유효한 방향과 신뢰도가 일정 시간 유지되면 음원 방향 추종
 //          -> REACQUIRE: 방향을 잃으면 반대 회전 탐색으로 다시 공간 표본 수집
@@ -30,6 +32,7 @@ namespace audio_capture
 class SnrGradientHomingControllerNode : public rclcpp::Node
 {
 public:
+    // [제어 노드 초기화] homing 입력, 안전 파라미터, 상태기계, RC 출력과 주기 timer를 구성한다.
     explicit SnrGradientHomingControllerNode(
         const rclcpp::NodeOptions & options = rclcpp::NodeOptions())
     : Node("snr_gradient_homing_controller", options)
@@ -48,13 +51,19 @@ public:
         near_source_topic_ =
             declare_parameter<std::string>("near_source_topic", "/homing/near_source");
         reset_topic_ = declare_parameter<std::string>("reset_topic", "/homing/reset_estimator");
+        odometry_topic_ =
+            declare_parameter<std::string>("odometry_topic", "/odometry/filtered");
         rc_override_topic_ =
             declare_parameter<std::string>("rc_override_topic", "/mavros/rc/override");
+        rc_preview_topic_ =
+            declare_parameter<std::string>("rc_preview_topic", "/homing/rc_override_preview");
         required_direction_frame_ =
             declare_parameter<std::string>("required_direction_frame", "base_link");
 
         // 상태 전환과 방향 유효성 설정.
         control_enabled_ = declare_parameter<bool>("control_enabled", false);
+        dry_run_ = declare_parameter<bool>("dry_run", true);
+        enable_arrival_detection_ = declare_parameter<bool>("enable_arrival_detection", false);
         rate_hz_ = clamp(declare_parameter<double>("rate_hz", 30.0), 1.0, 120.0);
         direction_timeout_s_ =
             clamp(declare_parameter<double>("direction_timeout_s", 0.8), 0.05, 10.0);
@@ -73,6 +82,40 @@ public:
         max_direction_std_rad_ = clamp(
             declare_parameter<double>("max_direction_std_rad", 0.30), 0.01, PI);
         arrived_hold_s_ = clamp(declare_parameter<double>("arrived_hold_s", 1.0), 0.0, 30.0);
+        estimator_ready_timeout_s_ = clamp(
+            declare_parameter<double>("estimator_ready_timeout_s", 1.0), 0.05, 10.0);
+        near_source_timeout_s_ = clamp(
+            declare_parameter<double>("near_source_timeout_s", 1.0), 0.05, 10.0);
+
+        // 경기장 좌표와 모서리 이탈 대각선 이동 설정.
+        arena_width_m_ = std::max(
+            0.1, declare_parameter<double>("particle_area_width_m", 15.0));
+        arena_height_m_ = std::max(
+            0.1, declare_parameter<double>("particle_area_height_m", 16.0));
+        arena_start_corner_ =
+            declare_parameter<std::string>("particle_start_corner", "bottom_left");
+        if (arena_start_corner_ != "bottom_left" &&
+            arena_start_corner_ != "bottom_right")
+        {
+            RCLCPP_WARN(
+                get_logger(),
+                "Unknown particle_start_corner '%s'; using bottom_left.",
+                arena_start_corner_.c_str());
+            arena_start_corner_ = "bottom_left";
+        }
+        arena_yaw_rad_ = declare_parameter<double>("particle_area_yaw_rad", 0.0);
+        geofence_margin_m_ = std::clamp(
+            declare_parameter<double>("geofence_margin_m", 0.20),
+            0.0,
+            0.49 * std::min(arena_width_m_, arena_height_m_));
+        initial_diagonal_distance_m_ = clamp(
+            declare_parameter<double>("initial_diagonal_distance_m", 0.70), 0.0, 20.0);
+        initial_diagonal_command_ = clamp(
+            declare_parameter<double>("initial_diagonal_command", 0.30), 0.0, 1.0);
+        initial_diagonal_timeout_s_ = clamp(
+            declare_parameter<double>("initial_diagonal_timeout_s", 10.0), 0.1, 120.0);
+        odometry_timeout_s_ = clamp(
+            declare_parameter<double>("odometry_timeout_s", 0.50), 0.05, 10.0);
 
         // 초기/재탐색 원형 운동 설정. 부호는 실제 기체 yaw 채널 방향에 맞춘다.
         search_forward_ =
@@ -101,6 +144,7 @@ public:
         rc_pwm_span_ = clamp(declare_parameter<double>("rc_pwm_span", 400.0), 50.0, 700.0);
         invert_rc_heave_ = declare_parameter<bool>("invert_rc_heave", true);
         invert_rc_yaw_ = declare_parameter<bool>("invert_rc_yaw", true);
+        invert_rc_lateral_ = declare_parameter<bool>("invert_rc_lateral", false);
 
         direction_sub_ = create_subscription<geometry_msgs::msg::Vector3Stamped>(
             direction_topic_,
@@ -129,15 +173,24 @@ public:
         near_source_sub_ = create_subscription<std_msgs::msg::Bool>(
             near_source_topic_, 10,
             std::bind(&SnrGradientHomingControllerNode::near_source_callback, this, std::placeholders::_1));
+        odometry_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+            odometry_topic_, 20,
+            std::bind(&SnrGradientHomingControllerNode::odometry_callback, this, std::placeholders::_1));
 
         rc_pub_ = create_publisher<mavros_msgs::msg::OverrideRCIn>(rc_override_topic_, 10);
+        rc_preview_pub_ =
+            create_publisher<mavros_msgs::msg::OverrideRCIn>(rc_preview_topic_, 10);
         state_pub_ = create_publisher<std_msgs::msg::String>(
             state_topic_, rclcpp::QoS(1).reliable().transient_local());
         reset_pub_ = create_publisher<std_msgs::msg::Empty>(reset_topic_, 10);
 
-        state_ = control_enabled_ ? State::INITIAL_SEARCH : State::DISABLED;
+        state_ = State::DISABLED;
         state_enter_time_ = now();
-        publish_state();
+        if (control_enabled_) {
+            transition_to(State::INITIAL_DIAGONAL);
+        } else {
+            publish_state();
+        }
 
         const auto period = std::chrono::duration<double>(1.0 / rate_hz_);
         timer_ = create_wall_timer(
@@ -146,11 +199,13 @@ public:
 
         RCLCPP_INFO(
             get_logger(),
-            "SNR gradient controller ready. enabled=%s direction=%s frame=%s rc=%s",
+            "SNR gradient controller ready. enabled=%s dry_run=%s direction=%s frame=%s rc=%s preview=%s",
             control_enabled_ ? "true" : "false",
+            dry_run_ ? "true" : "false",
             direction_topic_.c_str(),
             required_direction_frame_.c_str(),
-            rc_override_topic_.c_str());
+            rc_override_topic_.c_str(),
+            rc_preview_topic_.c_str());
     }
 
 private:
@@ -167,6 +222,7 @@ private:
     enum class State
     {
         DISABLED,
+        INITIAL_DIAGONAL,
         INITIAL_SEARCH,
         HOMING,
         REACQUIRE,
@@ -181,6 +237,28 @@ private:
         double yaw = 0.0;
     };
 
+    // [Odometry 수신] 경기장 기준 모서리, 현재 위치·yaw와 초기 대각선 이동거리를 갱신한다.
+    void odometry_callback(const nav_msgs::msg::Odometry::ConstSharedPtr msg)
+    {
+        current_odometry_xy_ = Eigen::Vector2d(
+            msg->pose.pose.position.x, msg->pose.pose.position.y);
+        current_yaw_rad_ = yaw_from_quaternion(
+            msg->pose.pose.orientation.w,
+            msg->pose.pose.orientation.x,
+            msg->pose.pose.orientation.y,
+            msg->pose.pose.orientation.z);
+        last_odometry_receive_time_ = now();
+        have_odometry_ = true;
+        if (!have_arena_corner_) {
+            arena_corner_xy_ = current_odometry_xy_;
+            have_arena_corner_ = true;
+        }
+        if (state_ == State::INITIAL_DIAGONAL && !have_initial_diagonal_start_) {
+            capture_initial_diagonal_start();
+        }
+    }
+
+    // [Homing 방향 수신] frame과 수치를 검증해 단위 벡터로 저장하고 방향각 안정성 이력을 갱신한다.
     void direction_callback(const geometry_msgs::msg::Vector3Stamped::ConstSharedPtr msg)
     {
         // 좌표계가 다르면 body-frame 제어 입력으로 사용할 수 없다.
@@ -222,6 +300,7 @@ private:
         }
     }
 
+    // [방향 신뢰도 수신] 유효한 값을 0~1로 제한하고 freshness 판정용 수신 시각을 저장한다.
     void confidence_callback(const std_msgs::msg::Float64::ConstSharedPtr msg)
     {
         if (!std::isfinite(msg->data)) {
@@ -232,6 +311,7 @@ private:
         have_confidence_ = true;
     }
 
+    // [제어 enable 수신] 활성화하면 모서리 이탈 대각선 이동, 비활성화하면 RC 해제로 전환한다.
     void enable_callback(const std_msgs::msg::Bool::ConstSharedPtr msg)
     {
         if (msg->data == control_enabled_) {
@@ -242,64 +322,113 @@ private:
         have_acquire_start_ = false;
         have_last_valid_signal_time_ = false;
         if (control_enabled_) {
-            // enable 상승 시 항상 새로운 초기 탐색부터 시작한다.
-            transition_to(State::INITIAL_SEARCH);
+            // enable 상승 시 항상 모서리 이탈 대각선 이동부터 새 순서를 시작한다.
+            transition_to(State::INITIAL_DIAGONAL);
         } else {
             transition_to(State::DISABLED);
         }
     }
 
+    // [추정기 준비 상태 수신] gradient/PF 방향 사용 가능 여부와 최신 수신 시각을 기록한다.
     void estimator_ready_callback(const std_msgs::msg::Bool::ConstSharedPtr msg)
     {
         estimator_ready_ = msg->data;
         last_estimator_ready_time_ = now();
     }
 
+    // [음원 근접 상태 수신] 도착 판정 입력을 갱신하고 false이면 연속 근접 시간을 초기화한다.
     void near_source_callback(const std_msgs::msg::Bool::ConstSharedPtr msg)
     {
         near_source_ = msg->data;
+        last_near_source_time_ = now();
         if (!near_source_) {
             have_near_source_start_ = false;
         }
     }
 
+    // [폐루프 상태기계 실행] 비활성·탐색·homing·재탐색·도착 상태에 맞는 RC 명령을 결정한다.
     void control_loop()
     {
         const rclcpp::Time current_time = now();
 
         // 비활성 상태에서는 RC override를 해제하여 수동 조종을 방해하지 않는다.
         if (!control_enabled_ || state_ == State::DISABLED) {
-            rc_pub_->publish(make_release_override());
+            publish_rc(make_release_override());
             return;
         }
 
         if (state_ == State::ARRIVED) {
-            rc_pub_->publish(make_rc_override(Command{}));
+            if (enable_arrival_detection_ && !near_source_is_fresh(current_time)) {
+                transition_to(State::REACQUIRE);
+            }
+            publish_rc(make_rc_override(Command{}));
+            return;
+        }
+
+        // 실행 분기 A: 시작 모서리에서 경기장 중심 방향으로 목표 거리만큼 대각선 이동한다.
+        if (state_ == State::INITIAL_DIAGONAL) {
+            double traveled_m = 0.0;
+            if (have_initial_diagonal_start_ && odometry_is_fresh(current_time)) {
+                traveled_m = (current_odometry_xy_ - initial_diagonal_start_xy_).norm();
+            }
+            if (have_initial_diagonal_start_ && odometry_is_fresh(current_time) &&
+                traveled_m >= initial_diagonal_distance_m_)
+            {
+                // 이 위치부터 새 SNR/gradient/PF 표본을 모으도록 reset한 뒤 원형 탐색을 시작한다.
+                publish_rc(make_rc_override(Command{}));
+                transition_to(State::INITIAL_SEARCH);
+                return;
+            }
+            const rclcpp::Time timeout_start =
+                have_initial_diagonal_start_ ? initial_diagonal_start_time_ : state_enter_time_;
+            if ((current_time - timeout_start).seconds() >= initial_diagonal_timeout_s_)
+            {
+                RCLCPP_ERROR(
+                    get_logger(),
+                    "Initial diagonal timed out at %.2f/%.2f m; control disabled.",
+                    traveled_m,
+                    initial_diagonal_distance_m_);
+                control_enabled_ = false;
+                transition_to(State::DISABLED);
+                publish_rc(make_release_override());
+                return;
+            }
+            if (!have_initial_diagonal_start_ || !odometry_is_fresh(current_time)) {
+                publish_rc(make_rc_override(Command{}));
+                return;
+            }
+            publish_rc(make_rc_override(initial_diagonal_command()));
+            return;
+        }
+
+        // 경기장 경계 clamp에 필요한 odometry가 오래되면 모든 이동축을 중립으로 둔다.
+        if (!odometry_is_fresh(current_time)) {
+            publish_rc(make_rc_override(Command{}));
             return;
         }
 
         const bool signal_valid = have_valid_signal(current_time);
 
-        // 실행 분기 A: 초기 탐색 또는 방향 재탐색.
+        // 실행 분기 B: 초기 탐색 또는 방향 재탐색.
         if (state_ == State::INITIAL_SEARCH || state_ == State::REACQUIRE) {
             update_search_acquisition(current_time, signal_valid);
             if (state_ == State::HOMING) {
-                rc_pub_->publish(make_rc_override(homing_command()));
+                publish_rc(make_rc_override(homing_command()));
             } else {
-                rc_pub_->publish(make_rc_override(search_command()));
+                publish_rc(make_rc_override(search_command()));
             }
             return;
         }
 
-        // 실행 분기 B: 유효한 방향을 따라 음원 쪽으로 전진한다.
+        // 실행 분기 C: 유효한 방향을 따라 음원 쪽으로 전진한다.
         if (state_ == State::HOMING && signal_valid) {
-            if (near_source_) {
+            if (enable_arrival_detection_ && near_source_is_fresh(current_time)) {
                 if (!have_near_source_start_) {
                     near_source_start_time_ = current_time;
                     have_near_source_start_ = true;
                 } else if ((current_time - near_source_start_time_).seconds() >= arrived_hold_s_) {
                     transition_to(State::ARRIVED);
-                    rc_pub_->publish(make_rc_override(Command{}));
+                    publish_rc(make_rc_override(Command{}));
                     return;
                 }
             } else {
@@ -307,12 +436,12 @@ private:
             }
             last_valid_signal_time_ = current_time;
             have_last_valid_signal_time_ = true;
-            rc_pub_->publish(make_rc_override(homing_command()));
+            publish_rc(make_rc_override(homing_command()));
             return;
         }
 
-        // 실행 분기 C: 일시적인 방향 손실 동안 잘못된 방향으로 진행하지 않는다.
-        rc_pub_->publish(make_rc_override(Command{}));
+        // 실행 분기 D: 일시적인 방향 손실 동안 잘못된 방향으로 진행하지 않는다.
+        publish_rc(make_rc_override(Command{}));
         if (!have_last_valid_signal_time_) {
             last_valid_signal_time_ = current_time;
             have_last_valid_signal_time_ = true;
@@ -325,10 +454,11 @@ private:
         }
     }
 
+    // [탐색 중 신호 획득] 준비되고 안정적인 방향이 일정 시간 유지되면 HOMING으로 전환한다.
     void update_search_acquisition(const rclcpp::Time & current_time, const bool signal_valid)
     {
         // 방향이 불안정하면 연속 획득 시간을 처음부터 다시 센다.
-        if (!signal_valid || !estimator_ready_ || !direction_is_stable()) {
+        if (!signal_valid || !estimator_ready_is_fresh(current_time) || !direction_is_stable()) {
             have_acquire_start_ = false;
             return;
         }
@@ -348,6 +478,7 @@ private:
         transition_to(State::HOMING);
     }
 
+    // [신호 유효성 판정] 방향·신뢰도의 timeout과 최소 신뢰도 조건을 함께 검사한다.
     bool have_valid_signal(const rclcpp::Time & current_time) const
     {
         if (!have_direction_ || !have_confidence_) {
@@ -361,6 +492,7 @@ private:
         return direction_confidence_ >= min_direction_confidence_;
     }
 
+    // [방향 안정성 판정] 최근 body-frame bearing의 원형 분산이 허용치 이하인지 확인한다.
     bool direction_is_stable() const
     {
         if (bearing_history_.size() < 3) {
@@ -380,6 +512,64 @@ private:
             max_direction_std_rad_;
     }
 
+    // [준비 상태 freshness] estimator-ready가 true이며 지정 timeout 안에 갱신됐는지 확인한다.
+    bool estimator_ready_is_fresh(const rclcpp::Time & current_time) const
+    {
+        return estimator_ready_ &&
+            (current_time - last_estimator_ready_time_).seconds() <= estimator_ready_timeout_s_;
+    }
+
+    // [근접 상태 freshness] near-source가 true이며 지정 timeout 안에 갱신됐는지 확인한다.
+    bool near_source_is_fresh(const rclcpp::Time & current_time) const
+    {
+        return near_source_ &&
+            (current_time - last_near_source_time_).seconds() <= near_source_timeout_s_;
+    }
+
+    // [Odometry freshness] 경계 제어가 오래된 위치값으로 계속 진행되지 않도록 수신 시각을 검사한다.
+    bool odometry_is_fresh(const rclcpp::Time & current_time) const
+    {
+        return have_odometry_ &&
+            (current_time - last_odometry_receive_time_).seconds() <= odometry_timeout_s_;
+    }
+
+    // [초기 대각선 기준점 저장] 첫 유효 odometry 위치와 시각을 거리·timeout 계산 원점으로 잡는다.
+    void capture_initial_diagonal_start()
+    {
+        if (!have_odometry_) {
+            return;
+        }
+        initial_diagonal_start_xy_ = current_odometry_xy_;
+        initial_diagonal_start_time_ = now();
+        have_initial_diagonal_start_ = true;
+    }
+
+    // [초기 대각선 명령 생성] 시작 모서리에서 경기장 중심 쪽 world 방향을 body forward+sway로 변환한다.
+    Command initial_diagonal_command() const
+    {
+        const double horizontal_sign =
+            arena_start_corner_ == "bottom_right" ? -1.0 : 1.0;
+        Eigen::Vector2d arena_direction(
+            horizontal_sign * arena_width_m_, arena_height_m_);
+        arena_direction.normalize();
+
+        const double arena_c = std::cos(arena_yaw_rad_);
+        const double arena_s = std::sin(arena_yaw_rad_);
+        const Eigen::Vector2d world_direction(
+            arena_c * arena_direction.x() - arena_s * arena_direction.y(),
+            arena_s * arena_direction.x() + arena_c * arena_direction.y());
+
+        const double yaw_c = std::cos(current_yaw_rad_);
+        const double yaw_s = std::sin(current_yaw_rad_);
+        Command command;
+        command.forward = initial_diagonal_command_ *
+            (yaw_c * world_direction.x() + yaw_s * world_direction.y());
+        command.sway = initial_diagonal_command_ *
+            (-yaw_s * world_direction.x() + yaw_c * world_direction.y());
+        return command;
+    }
+
+    // [탐색 명령 생성] 전진과 일정 yaw를 조합해 방향 관측을 위한 원호 주행 명령을 만든다.
     Command search_command() const
     {
         // 전진과 일정 yaw를 동시에 주어 원형 또는 충분한 곡률의 호를 만든다.
@@ -389,6 +579,7 @@ private:
         return command;
     }
 
+    // [Homing 명령 생성] 방향 오차·z 방향·신뢰도에 따라 전진, yaw, heave 명령을 계산한다.
     Command homing_command() const
     {
         Command command;
@@ -419,8 +610,60 @@ private:
         return command;
     }
 
+    // [경기장 경계 clamp] body 이동 명령을 경기장 축으로 바꾸고 벽 쪽 성분만 제거한다.
+    Command clamp_command_to_arena(const Command & command) const
+    {
+        Command bounded = command;
+        if (!have_odometry_ || !have_arena_corner_) {
+            bounded.forward = 0.0;
+            bounded.sway = 0.0;
+            return bounded;
+        }
+
+        const double arena_c = std::cos(arena_yaw_rad_);
+        const double arena_s = std::sin(arena_yaw_rad_);
+        const Eigen::Vector2d offset = current_odometry_xy_ - arena_corner_xy_;
+        const double raw_x = arena_c * offset.x() + arena_s * offset.y();
+        const double arena_x =
+            raw_x + (arena_start_corner_ == "bottom_right" ? arena_width_m_ : 0.0);
+        const double arena_y = -arena_s * offset.x() + arena_c * offset.y();
+
+        const double yaw_c = std::cos(current_yaw_rad_);
+        const double yaw_s = std::sin(current_yaw_rad_);
+        const Eigen::Vector2d world_velocity(
+            yaw_c * command.forward - yaw_s * command.sway,
+            yaw_s * command.forward + yaw_c * command.sway);
+        Eigen::Vector2d arena_velocity(
+            arena_c * world_velocity.x() + arena_s * world_velocity.y(),
+            -arena_s * world_velocity.x() + arena_c * world_velocity.y());
+
+        if (arena_x <= geofence_margin_m_ && arena_velocity.x() < 0.0) {
+            arena_velocity.x() = 0.0;
+        }
+        if (arena_x >= arena_width_m_ - geofence_margin_m_ && arena_velocity.x() > 0.0) {
+            arena_velocity.x() = 0.0;
+        }
+        if (arena_y <= geofence_margin_m_ && arena_velocity.y() < 0.0) {
+            arena_velocity.y() = 0.0;
+        }
+        if (arena_y >= arena_height_m_ - geofence_margin_m_ && arena_velocity.y() > 0.0) {
+            arena_velocity.y() = 0.0;
+        }
+
+        const Eigen::Vector2d bounded_world_velocity(
+            arena_c * arena_velocity.x() - arena_s * arena_velocity.y(),
+            arena_s * arena_velocity.x() + arena_c * arena_velocity.y());
+        bounded.forward =
+            yaw_c * bounded_world_velocity.x() + yaw_s * bounded_world_velocity.y();
+        bounded.sway =
+            -yaw_s * bounded_world_velocity.x() + yaw_c * bounded_world_velocity.y();
+        return bounded;
+    }
+
+    // [RC override 변환] 정규화된 4축 명령을 MAVROS 채널별 PWM으로 매핑한다.
     mavros_msgs::msg::OverrideRCIn make_rc_override(const Command & command) const
     {
+        const Command bounded = clamp_command_to_arena(command);
         mavros_msgs::msg::OverrideRCIn msg;
         msg.channels.fill(mavros_msgs::msg::OverrideRCIn::CHAN_NOCHANGE);
         for (std::size_t index = 0;
@@ -432,13 +675,15 @@ private:
 
         msg.channels[PITCH_CHANNEL_INDEX] = RC_NEUTRAL;
         msg.channels[ROLL_CHANNEL_INDEX] = RC_NEUTRAL;
-        msg.channels[VERTICAL_CHANNEL_INDEX] = axis_pwm(command.heave, invert_rc_heave_);
-        msg.channels[YAW_CHANNEL_INDEX] = axis_pwm(command.yaw, invert_rc_yaw_);
-        msg.channels[FORWARD_CHANNEL_INDEX] = axis_pwm(command.forward, false);
-        msg.channels[LATERAL_CHANNEL_INDEX] = axis_pwm(command.sway, false);
+        msg.channels[VERTICAL_CHANNEL_INDEX] = axis_pwm(bounded.heave, invert_rc_heave_);
+        msg.channels[YAW_CHANNEL_INDEX] = axis_pwm(bounded.yaw, invert_rc_yaw_);
+        msg.channels[FORWARD_CHANNEL_INDEX] = axis_pwm(bounded.forward, false);
+        msg.channels[LATERAL_CHANNEL_INDEX] =
+            axis_pwm(bounded.sway, invert_rc_lateral_);
         return msg;
     }
 
+    // [RC override 해제 생성] 모든 채널을 CHAN_RELEASE로 채워 autopilot/수동 제어권을 돌려준다.
     mavros_msgs::msg::OverrideRCIn make_release_override() const
     {
         mavros_msgs::msg::OverrideRCIn msg;
@@ -446,6 +691,17 @@ private:
         return msg;
     }
 
+    // [RC 명령 발행] preview는 항상 발행하고 dry-run이 아닐 때만 실제 MAVROS로 전송한다.
+    void publish_rc(const mavros_msgs::msg::OverrideRCIn & msg)
+    {
+        // preview는 항상 발행해 dry-run과 실기에서 동일한 명령을 비교할 수 있다.
+        rc_preview_pub_->publish(msg);
+        if (!dry_run_) {
+            rc_pub_->publish(msg);
+        }
+    }
+
+    // [제어 상태 전환] 대각선·탐색 진입 상태를 초기화하고 필요한 시점에 추정기 reset을 요청한다.
     void transition_to(const State next_state)
     {
         if (state_ == next_state) {
@@ -454,8 +710,20 @@ private:
         state_ = next_state;
         state_enter_time_ = now();
         have_acquire_start_ = false;
-        if (next_state == State::INITIAL_SEARCH || next_state == State::REACQUIRE) {
+        if (next_state == State::INITIAL_DIAGONAL) {
+            have_initial_diagonal_start_ = false;
+            if (have_odometry_) {
+                capture_initial_diagonal_start();
+            }
+        }
+        if (next_state == State::INITIAL_DIAGONAL ||
+            next_state == State::INITIAL_SEARCH || next_state == State::REACQUIRE)
+        {
             estimator_ready_ = false;
+            near_source_ = false;
+            have_near_source_start_ = false;
+            have_direction_ = false;
+            have_confidence_ = false;
             bearing_history_.clear();
             reset_pub_->publish(std_msgs::msg::Empty{});
         }
@@ -463,6 +731,7 @@ private:
         RCLCPP_INFO(get_logger(), "Homing control state -> %s", state_name(state_));
     }
 
+    // [제어 상태 발행] 현재 enum 상태를 사람이 읽을 수 있는 문자열 토픽으로 내보낸다.
     void publish_state()
     {
         std_msgs::msg::String msg;
@@ -470,11 +739,14 @@ private:
         state_pub_->publish(msg);
     }
 
+    // [상태 이름 변환] 내부 상태 enum을 로그와 토픽에서 사용할 고정 문자열로 바꾼다.
     static const char * state_name(const State state)
     {
         switch (state) {
             case State::DISABLED:
                 return "DISABLED";
+            case State::INITIAL_DIAGONAL:
+                return "INITIAL_DIAGONAL";
             case State::INITIAL_SEARCH:
                 return "INITIAL_SEARCH";
             case State::HOMING:
@@ -487,6 +759,7 @@ private:
         return "UNKNOWN";
     }
 
+    // [축 명령 PWM 변환] -1~1 입력을 중립 기준 PWM으로 바꾸고 반전·안전 범위를 적용한다.
     std::uint16_t axis_pwm(const double value, const bool invert) const
     {
         const double axis = invert ? -value : value;
@@ -495,11 +768,13 @@ private:
         return static_cast<std::uint16_t>(std::clamp(pwm, 1100, 1900));
     }
 
+    // [범위 제한] 값이 지정한 하한과 상한을 벗어나지 않도록 제한한다.
     static double clamp(const double value, const double low, const double high)
     {
         return std::max(low, std::min(value, high));
     }
 
+    // [각도 정규화] 임의의 radian 각도를 -pi~pi 구간으로 접는다.
     static double wrap_pi(double angle)
     {
         while (angle > PI) {
@@ -511,17 +786,30 @@ private:
         return angle;
     }
 
+    // [Quaternion→Yaw 변환] odometry 자세에서 body/world 이동축 변환에 필요한 yaw를 계산한다.
+    static double yaw_from_quaternion(
+        const double w, const double x, const double y, const double z)
+    {
+        const double sin_yaw = 2.0 * (w * z + x * y);
+        const double cos_yaw = 1.0 - 2.0 * (y * y + z * z);
+        return std::atan2(sin_yaw, cos_yaw);
+    }
+
     std::string direction_topic_;
     std::string confidence_topic_;
     std::string enable_topic_;
     std::string state_topic_;
     std::string rc_override_topic_;
+    std::string rc_preview_topic_;
     std::string estimator_ready_topic_;
     std::string near_source_topic_;
     std::string reset_topic_;
+    std::string odometry_topic_;
     std::string required_direction_frame_;
 
     bool control_enabled_ = false;
+    bool dry_run_ = true;
+    bool enable_arrival_detection_ = false;
     double rate_hz_ = 30.0;
     double direction_timeout_s_ = 0.8;
     double confidence_timeout_s_ = 0.8;
@@ -532,6 +820,17 @@ private:
     double direction_stability_window_s_ = 1.0;
     double max_direction_std_rad_ = 0.30;
     double arrived_hold_s_ = 1.0;
+    double estimator_ready_timeout_s_ = 1.0;
+    double near_source_timeout_s_ = 1.0;
+    double arena_width_m_ = 15.0;
+    double arena_height_m_ = 16.0;
+    std::string arena_start_corner_ = "bottom_left";
+    double arena_yaw_rad_ = 0.0;
+    double geofence_margin_m_ = 0.20;
+    double initial_diagonal_distance_m_ = 0.70;
+    double initial_diagonal_command_ = 0.30;
+    double initial_diagonal_timeout_s_ = 10.0;
+    double odometry_timeout_s_ = 0.50;
 
     double search_forward_ = 0.30;
     double search_yaw_ = 0.30;
@@ -550,6 +849,7 @@ private:
     double rc_pwm_span_ = 400.0;
     bool invert_rc_heave_ = true;
     bool invert_rc_yaw_ = true;
+    bool invert_rc_lateral_ = false;
 
     State state_ = State::DISABLED;
     rclcpp::Time state_enter_time_;
@@ -557,6 +857,15 @@ private:
     bool have_acquire_start_ = false;
     rclcpp::Time last_valid_signal_time_;
     bool have_last_valid_signal_time_ = false;
+    Eigen::Vector2d current_odometry_xy_{0.0, 0.0};
+    Eigen::Vector2d arena_corner_xy_{0.0, 0.0};
+    Eigen::Vector2d initial_diagonal_start_xy_{0.0, 0.0};
+    double current_yaw_rad_ = 0.0;
+    rclcpp::Time initial_diagonal_start_time_;
+    rclcpp::Time last_odometry_receive_time_;
+    bool have_odometry_ = false;
+    bool have_arena_corner_ = false;
+    bool have_initial_diagonal_start_ = false;
 
     double direction_x_ = 1.0;
     double direction_y_ = 0.0;
@@ -571,6 +880,7 @@ private:
     bool have_near_source_start_ = false;
     rclcpp::Time near_source_start_time_;
     rclcpp::Time last_estimator_ready_time_;
+    rclcpp::Time last_near_source_time_;
     std::deque<std::pair<rclcpp::Time, double>> bearing_history_;
 
     rclcpp::Subscription<geometry_msgs::msg::Vector3Stamped>::SharedPtr direction_sub_;
@@ -578,7 +888,9 @@ private:
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr enable_sub_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr estimator_ready_sub_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr near_source_sub_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odometry_sub_;
     rclcpp::Publisher<mavros_msgs::msg::OverrideRCIn>::SharedPtr rc_pub_;
+    rclcpp::Publisher<mavros_msgs::msg::OverrideRCIn>::SharedPtr rc_preview_pub_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr state_pub_;
     rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr reset_pub_;
     rclcpp::TimerBase::SharedPtr timer_;
