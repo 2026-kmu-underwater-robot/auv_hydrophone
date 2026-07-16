@@ -16,21 +16,23 @@ def generate_launch_description():
     depth_topic = LaunchConfiguration("depth_topic")
     reference_frequency_hz = LaunchConfiguration("reference_frequency_hz")
     audio_input_latency_s = LaunchConfiguration("audio_input_latency_s")
-    direction_source = LaunchConfiguration("direction_source")
-    horizontal_only = LaunchConfiguration("horizontal_only")
-    particle_count = LaunchConfiguration("particle_count")
-    particle_area_width_m = LaunchConfiguration("particle_area_width_m")
-    particle_area_height_m = LaunchConfiguration("particle_area_height_m")
-    particle_start_corner = LaunchConfiguration("particle_start_corner")
-    particle_area_yaw_rad = LaunchConfiguration("particle_area_yaw_rad")
-    particle_roughening_std_m = LaunchConfiguration("particle_roughening_std_m")
+    arena_width_m = LaunchConfiguration("arena_width_m")
+    arena_height_m = LaunchConfiguration("arena_height_m")
+    arena_start_corner = LaunchConfiguration("arena_start_corner")
+    arena_yaw_rad = LaunchConfiguration("arena_yaw_rad")
+    arena_start_inset_m = LaunchConfiguration("arena_start_inset_m")
+    map_cell_size_m = LaunchConfiguration("map_cell_size_m")
+    local_radius_m = LaunchConfiguration("local_radius_m")
+    map_radius_m = LaunchConfiguration("map_radius_m")
     control_enabled = LaunchConfiguration("control_enabled")
     controller_dry_run = LaunchConfiguration("controller_dry_run")
-    enable_arrival_detection = LaunchConfiguration("enable_arrival_detection")
     geofence_margin_m = LaunchConfiguration("geofence_margin_m")
     initial_diagonal_distance_m = LaunchConfiguration("initial_diagonal_distance_m")
     initial_diagonal_command = LaunchConfiguration("initial_diagonal_command")
     initial_diagonal_timeout_s = LaunchConfiguration("initial_diagonal_timeout_s")
+    vertical_search_distance_m = LaunchConfiguration("vertical_search_distance_m")
+    vertical_search_min_z_m = LaunchConfiguration("vertical_search_min_z_m")
+    vertical_search_max_z_m = LaunchConfiguration("vertical_search_max_z_m")
     search_forward = LaunchConfiguration("search_forward")
     search_yaw = LaunchConfiguration("search_yaw")
     search_turn_sign = LaunchConfiguration("search_turn_sign")
@@ -61,40 +63,44 @@ def generate_launch_description():
             description="오디오 수신 시각에서 추가로 보정할 캡처/전송 지연(초).",
         ),
         DeclareLaunchArgument(
-            "direction_source",
-            default_value="blend",
-            description="방향 선택 방식: gradient, particle 또는 blend.",
-        ),
-        DeclareLaunchArgument(
-            "horizontal_only",
-            default_value="true",
-            description="첫 고정 pinger 시험에서는 AUV와 pinger 수심을 맞추고 true를 사용한다.",
-        ),
-        DeclareLaunchArgument(
-            "particle_area_width_m",
+            "arena_width_m",
             default_value="2.0",
             description="수조/경기장의 가로 폭(m).",
         ),
         DeclareLaunchArgument(
-            "particle_area_height_m",
+            "arena_height_m",
             default_value="5.0",
             description="수조/경기장의 세로 길이(m).",
         ),
-        DeclareLaunchArgument("particle_count", default_value="500"),
         DeclareLaunchArgument(
-            "particle_start_corner",
+            "arena_start_corner",
             default_value="bottom_left",
             description="AUV 시작 모서리: bottom_left 또는 bottom_right.",
         ),
         DeclareLaunchArgument(
-            "particle_area_yaw_rad",
+            "arena_yaw_rad",
             default_value="0.0",
             description="odom 좌표계에서 경기장 왼쪽→오른쪽 축의 yaw(rad).",
         ),
         DeclareLaunchArgument(
-            "particle_roughening_std_m",
-            default_value="0.05",
-            description="고정 pinger 수조 시험용 재표본화 위치 잡음 표준편차.",
+            "arena_start_inset_m",
+            default_value="0.12",
+            description="첫 odometry 위치를 경기장 모서리에서 안쪽으로 둘 거리(m).",
+        ),
+        DeclareLaunchArgument(
+            "map_cell_size_m",
+            default_value="0.12",
+            description="정재파의 수 cm 공간 페이딩을 median 처리할 격자 셀 크기(m).",
+        ),
+        DeclareLaunchArgument(
+            "local_radius_m",
+            default_value="0.75",
+            description="원시 SNR robust local gradient의 공간 반경(m).",
+        ),
+        DeclareLaunchArgument(
+            "map_radius_m",
+            default_value="2.0",
+            description="격자 median SNR map gradient의 공간 반경(m).",
         ),
         DeclareLaunchArgument(
             "control_enabled",
@@ -105,11 +111,6 @@ def generate_launch_description():
             "controller_dry_run",
             default_value="true",
             description="true이면 preview만 발행하고 실제 MAVROS RC override는 발행하지 않는다.",
-        ),
-        DeclareLaunchArgument(
-            "enable_arrival_detection",
-            default_value="false",
-            description="near-source 임계값을 수조에서 보정하기 전에는 false로 둔다.",
         ),
         DeclareLaunchArgument(
             "geofence_margin_m",
@@ -130,6 +131,21 @@ def generate_launch_description():
             "initial_diagonal_timeout_s",
             default_value="10.0",
             description="목표 거리에 도달하지 못하면 제어를 해제하는 안전 timeout(초).",
+        ),
+        DeclareLaunchArgument(
+            "vertical_search_distance_m",
+            default_value="0.50",
+            description="SNR trigger 후 현재 수심에서 위·아래로 탐색할 거리(m).",
+        ),
+        DeclareLaunchArgument(
+            "vertical_search_min_z_m",
+            default_value="-1.30",
+            description="수직 탐색에서 허용할 가장 깊은 odometry z(m).",
+        ),
+        DeclareLaunchArgument(
+            "vertical_search_max_z_m",
+            default_value="-0.20",
+            description="수직 탐색에서 허용할 가장 얕은 odometry z(m).",
         ),
         DeclareLaunchArgument("search_forward", default_value="0.30"),
         DeclareLaunchArgument("search_yaw", default_value="0.30"),
@@ -175,30 +191,19 @@ def generate_launch_description():
             ),
             ComposableNode(
                 package="audio_capture",
-                plugin="audio_capture::SnrGradientHomingNode",
-                name="snr_gradient_homing",
+                plugin="audio_capture::SnrGradientHomingNodeV2",
+                name="snr_gradient_homing_v2",
                 parameters=[
                     {
                         "use_sim_time": ParameterValue(use_sim_time, value_type=bool),
-                        "odometry_topic": odometry_topic,
-                        "depth_topic": depth_topic,
-                        "output_frame": "base_link",
-                        "output_frame_id": "base_link",
-                        "direction_source": direction_source,
-                        "horizontal_only": ParameterValue(horizontal_only, value_type=bool),
-                        "particle_count": ParameterValue(particle_count, value_type=int),
-                        "particle_area_width_m": ParameterValue(
-                            particle_area_width_m, value_type=float
+                        "map_cell_size_m": ParameterValue(
+                            map_cell_size_m, value_type=float
                         ),
-                        "particle_area_height_m": ParameterValue(
-                            particle_area_height_m, value_type=float
+                        "local_radius_m": ParameterValue(
+                            local_radius_m, value_type=float
                         ),
-                        "particle_start_corner": particle_start_corner,
-                        "particle_area_yaw_rad": ParameterValue(
-                            particle_area_yaw_rad, value_type=float
-                        ),
-                        "particle_roughening_std_m": ParameterValue(
-                            particle_roughening_std_m, value_type=float
+                        "map_radius_m": ParameterValue(
+                            map_radius_m, value_type=float
                         ),
                     }
                 ],
@@ -212,19 +217,19 @@ def generate_launch_description():
                         "use_sim_time": ParameterValue(use_sim_time, value_type=bool),
                         "control_enabled": ParameterValue(control_enabled, value_type=bool),
                         "dry_run": ParameterValue(controller_dry_run, value_type=bool),
-                        "enable_arrival_detection": ParameterValue(
-                            enable_arrival_detection, value_type=bool
-                        ),
                         "odometry_topic": odometry_topic,
-                        "particle_area_width_m": ParameterValue(
-                            particle_area_width_m, value_type=float
+                        "arena_width_m": ParameterValue(
+                            arena_width_m, value_type=float
                         ),
-                        "particle_area_height_m": ParameterValue(
-                            particle_area_height_m, value_type=float
+                        "arena_height_m": ParameterValue(
+                            arena_height_m, value_type=float
                         ),
-                        "particle_start_corner": particle_start_corner,
-                        "particle_area_yaw_rad": ParameterValue(
-                            particle_area_yaw_rad, value_type=float
+                        "arena_start_corner": arena_start_corner,
+                        "arena_yaw_rad": ParameterValue(
+                            arena_yaw_rad, value_type=float
+                        ),
+                        "arena_start_inset_m": ParameterValue(
+                            arena_start_inset_m, value_type=float
                         ),
                         "geofence_margin_m": ParameterValue(
                             geofence_margin_m, value_type=float
@@ -237,6 +242,15 @@ def generate_launch_description():
                         ),
                         "initial_diagonal_timeout_s": ParameterValue(
                             initial_diagonal_timeout_s, value_type=float
+                        ),
+                        "vertical_search_distance_m": ParameterValue(
+                            vertical_search_distance_m, value_type=float
+                        ),
+                        "vertical_search_min_z_m": ParameterValue(
+                            vertical_search_min_z_m, value_type=float
+                        ),
+                        "vertical_search_max_z_m": ParameterValue(
+                            vertical_search_max_z_m, value_type=float
                         ),
                         "required_direction_frame": "base_link",
                         "search_forward": ParameterValue(search_forward, value_type=float),

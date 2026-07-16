@@ -24,6 +24,7 @@ add_library(${PROJECT_NAME} SHARED
   src/audio_frequency_detector.cpp
   src/audio_phase_estimator.cpp
   src/snr_gradient_homing_node.cpp
+  src/snr_gradient_homing_node_v2.cpp
   src/snr_gradient_homing_controller_node.cpp
   src/homing_controller_node.cpp
   src/simple_homing_controller_node.cpp
@@ -99,6 +100,12 @@ rclcpp_components_register_node(
 
 rclcpp_components_register_node(
   ${PROJECT_NAME}
+  PLUGIN "audio_capture::SnrGradientHomingNodeV2"
+  EXECUTABLE snr_gradient_homing_v2
+)
+
+rclcpp_components_register_node(
+  ${PROJECT_NAME}
   PLUGIN "audio_capture::SnrGradientHomingControllerNode"
   EXECUTABLE snr_gradient_homing_controller
 )
@@ -129,6 +136,7 @@ install(TARGETS
   audio_frequency_detector
   audio_phase_estimator
   snr_gradient_homing
+  snr_gradient_homing_v2
   snr_gradient_homing_controller
   homing_controller
   simple_homing_controller
@@ -140,6 +148,11 @@ install(TARGETS
 
 install(DIRECTORY launch
   DESTINATION share/${PROJECT_NAME}
+)
+
+install(PROGRAMS
+  scripts/snr_map_visualizer.py
+  DESTINATION lib/${PROJECT_NAME}
 )
 
 ament_export_libraries(
