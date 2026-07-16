@@ -26,9 +26,9 @@ namespace audio_capture
 //      enable=true
 //          -> INITIAL_DIAGONAL: 모서리에서 경기장 중심 방향으로 대각선 이동
 //          -> INITIAL_SEARCH: 전진+yaw 명령으로 원형/호 궤적 생성
+//          -> VERTICAL_SEARCH: SNR 10 dB 지속 시 위·아래 sweep 후 최고 SNR z로 이동
 //          -> HOMING: 유효한 방향과 신뢰도가 일정 시간 유지되면 음원 방향 추종
-//          -> REACQUIRE: 방향을 잃으면 반대 회전 탐색으로 다시 공간 표본 수집
-//          -> HOMING: 방향을 다시 획득하면 추종 재개
+//          -> DISABLED: 방향을 일정 시간 잃으면 자동 재탐색 없이 안전하게 제어 해제
 class SnrGradientHomingControllerNode : public rclcpp::Node
 {
 public:
@@ -48,8 +48,6 @@ public:
             declare_parameter<std::string>("state_topic", "/homing/control_state");
         estimator_ready_topic_ =
             declare_parameter<std::string>("estimator_ready_topic", "/homing/estimator_ready");
-        near_source_topic_ =
-            declare_parameter<std::string>("near_source_topic", "/homing/near_source");
         reset_topic_ = declare_parameter<std::string>("reset_topic", "/homing/reset_estimator");
         odometry_topic_ =
             declare_parameter<std::string>("odometry_topic", "/odometry/filtered");
@@ -63,7 +61,6 @@ public:
         // 상태 전환과 방향 유효성 설정.
         control_enabled_ = declare_parameter<bool>("control_enabled", false);
         dry_run_ = declare_parameter<bool>("dry_run", true);
-        enable_arrival_detection_ = declare_parameter<bool>("enable_arrival_detection", false);
         rate_hz_ = clamp(declare_parameter<double>("rate_hz", 30.0), 1.0, 120.0);
         direction_timeout_s_ =
             clamp(declare_parameter<double>("direction_timeout_s", 0.8), 0.05, 10.0);
@@ -81,29 +78,30 @@ public:
             declare_parameter<double>("direction_stability_window_s", 1.0), 0.1, 10.0);
         max_direction_std_rad_ = clamp(
             declare_parameter<double>("max_direction_std_rad", 0.30), 0.01, PI);
-        arrived_hold_s_ = clamp(declare_parameter<double>("arrived_hold_s", 1.0), 0.0, 30.0);
         estimator_ready_timeout_s_ = clamp(
             declare_parameter<double>("estimator_ready_timeout_s", 1.0), 0.05, 10.0);
-        near_source_timeout_s_ = clamp(
-            declare_parameter<double>("near_source_timeout_s", 1.0), 0.05, 10.0);
 
         // 경기장 좌표와 모서리 이탈 대각선 이동 설정.
         arena_width_m_ = std::max(
-            0.1, declare_parameter<double>("particle_area_width_m", 15.0));
+            0.1, declare_parameter<double>("arena_width_m", 15.0));
         arena_height_m_ = std::max(
-            0.1, declare_parameter<double>("particle_area_height_m", 16.0));
+            0.1, declare_parameter<double>("arena_height_m", 16.0));
         arena_start_corner_ =
-            declare_parameter<std::string>("particle_start_corner", "bottom_left");
+            declare_parameter<std::string>("arena_start_corner", "bottom_left");
         if (arena_start_corner_ != "bottom_left" &&
             arena_start_corner_ != "bottom_right")
         {
             RCLCPP_WARN(
                 get_logger(),
-                "Unknown particle_start_corner '%s'; using bottom_left.",
+                "Unknown arena_start_corner '%s'; using bottom_left.",
                 arena_start_corner_.c_str());
             arena_start_corner_ = "bottom_left";
         }
-        arena_yaw_rad_ = declare_parameter<double>("particle_area_yaw_rad", 0.0);
+        arena_yaw_rad_ = declare_parameter<double>("arena_yaw_rad", 0.0);
+        arena_start_inset_m_ = std::clamp(
+            declare_parameter<double>("arena_start_inset_m", 0.12),
+            0.0,
+            0.49 * std::min(arena_width_m_, arena_height_m_));
         geofence_margin_m_ = std::clamp(
             declare_parameter<double>("geofence_margin_m", 0.20),
             0.0,
@@ -116,16 +114,23 @@ public:
             declare_parameter<double>("initial_diagonal_timeout_s", 10.0), 0.1, 120.0);
         odometry_timeout_s_ = clamp(
             declare_parameter<double>("odometry_timeout_s", 0.50), 0.05, 10.0);
+        vertical_search_distance_m_ = clamp(
+            declare_parameter<double>("vertical_search_distance_m", 0.50), 0.05, 5.0);
+        vertical_search_min_z_m_ =
+            declare_parameter<double>("vertical_search_min_z_m", -1.30);
+        vertical_search_max_z_m_ =
+            declare_parameter<double>("vertical_search_max_z_m", -0.20);
+        if (vertical_search_min_z_m_ > vertical_search_max_z_m_) {
+            std::swap(vertical_search_min_z_m_, vertical_search_max_z_m_);
+        }
 
-        // 초기/재탐색 원형 운동 설정. 부호는 실제 기체 yaw 채널 방향에 맞춘다.
+        // 초기 원형 탐색 설정. 부호는 실제 기체 yaw 채널 방향에 맞춘다.
         search_forward_ =
             clamp(declare_parameter<double>("search_forward", 0.30), 0.0, 1.0);
         search_yaw_ =
             clamp(declare_parameter<double>("search_yaw", 0.30), 0.0, 1.0);
         search_turn_sign_ =
             declare_parameter<double>("search_turn_sign", 1.0) < 0.0 ? -1.0 : 1.0;
-        alternate_search_direction_ =
-            declare_parameter<bool>("alternate_search_direction", true);
 
         // 방향 추종 설정. direction은 base_link 기준 단위 벡터를 기대한다.
         forward_fast_ = clamp(declare_parameter<double>("forward_fast", 0.70), 0.0, 1.0);
@@ -170,12 +175,23 @@ public:
         estimator_ready_sub_ = create_subscription<std_msgs::msg::Bool>(
             estimator_ready_topic_, 10,
             std::bind(&SnrGradientHomingControllerNode::estimator_ready_callback, this, std::placeholders::_1));
-        near_source_sub_ = create_subscription<std_msgs::msg::Bool>(
-            near_source_topic_, 10,
-            std::bind(&SnrGradientHomingControllerNode::near_source_callback, this, std::placeholders::_1));
         odometry_sub_ = create_subscription<nav_msgs::msg::Odometry>(
             odometry_topic_, 20,
             std::bind(&SnrGradientHomingControllerNode::odometry_callback, this, std::placeholders::_1));
+        vertical_search_request_sub_ = create_subscription<std_msgs::msg::Bool>(
+            "/homing/vertical_search_request",
+            rclcpp::QoS(1).reliable().transient_local(),
+            std::bind(
+                &SnrGradientHomingControllerNode::vertical_search_request_callback,
+                this,
+                std::placeholders::_1));
+        vertical_best_z_sub_ = create_subscription<std_msgs::msg::Float64>(
+            "/homing/vertical_best_z",
+            rclcpp::QoS(1).reliable().transient_local(),
+            std::bind(
+                &SnrGradientHomingControllerNode::vertical_best_z_callback,
+                this,
+                std::placeholders::_1));
 
         rc_pub_ = create_publisher<mavros_msgs::msg::OverrideRCIn>(rc_override_topic_, 10);
         rc_preview_pub_ =
@@ -183,6 +199,10 @@ public:
         state_pub_ = create_publisher<std_msgs::msg::String>(
             state_topic_, rclcpp::QoS(1).reliable().transient_local());
         reset_pub_ = create_publisher<std_msgs::msg::Empty>(reset_topic_, 10);
+        vertical_search_active_pub_ = create_publisher<std_msgs::msg::Bool>(
+            "/homing/vertical_search_active",
+            rclcpp::QoS(1).reliable().transient_local());
+        publish_vertical_search_active(false);
 
         state_ = State::DISABLED;
         state_enter_time_ = now();
@@ -218,15 +238,23 @@ private:
     static constexpr std::size_t FORWARD_CHANNEL_INDEX = 4;
     static constexpr std::size_t LATERAL_CHANNEL_INDEX = 5;
     static constexpr std::size_t PRIMARY_CHANNEL_COUNT = 8;
+    static constexpr double VERTICAL_TARGET_TOLERANCE_M = 0.05;
+    static constexpr double VERTICAL_SEARCH_TIMEOUT_S = 40.0;
 
     enum class State
     {
         DISABLED,
         INITIAL_DIAGONAL,
         INITIAL_SEARCH,
-        HOMING,
-        REACQUIRE,
-        ARRIVED
+        VERTICAL_SEARCH,
+        HOMING
+    };
+
+    enum class VerticalSearchPhase
+    {
+        MOVE_UP,
+        MOVE_DOWN,
+        MOVE_BEST
     };
 
     struct Command
@@ -242,6 +270,7 @@ private:
     {
         current_odometry_xy_ = Eigen::Vector2d(
             msg->pose.pose.position.x, msg->pose.pose.position.y);
+        current_odometry_z_m_ = msg->pose.pose.position.z;
         current_yaw_rad_ = yaw_from_quaternion(
             msg->pose.pose.orientation.w,
             msg->pose.pose.orientation.x,
@@ -329,24 +358,31 @@ private:
         }
     }
 
-    // [추정기 준비 상태 수신] gradient/PF 방향 사용 가능 여부와 최신 수신 시각을 기록한다.
+    // [추정기 준비 상태 수신] V2 robust gradient 방향 사용 가능 여부와 최신 수신 시각을 기록한다.
     void estimator_ready_callback(const std_msgs::msg::Bool::ConstSharedPtr msg)
     {
         estimator_ready_ = msg->data;
         last_estimator_ready_time_ = now();
     }
 
-    // [음원 근접 상태 수신] 도착 판정 입력을 갱신하고 false이면 연속 근접 시간을 초기화한다.
-    void near_source_callback(const std_msgs::msg::Bool::ConstSharedPtr msg)
+    // [수직 탐색 요청 수신] V2의 one-shot SNR trigger 상태를 저장한다.
+    void vertical_search_request_callback(const std_msgs::msg::Bool::ConstSharedPtr msg)
     {
-        near_source_ = msg->data;
-        last_near_source_time_ = now();
-        if (!near_source_) {
-            have_near_source_start_ = false;
-        }
+        vertical_search_requested_ = msg->data;
     }
 
-    // [폐루프 상태기계 실행] 비활성·탐색·homing·재탐색·도착 상태에 맞는 RC 명령을 결정한다.
+    // [최고 SNR z 수신] sweep 중 V2가 추정한 최고 SNR odometry z를 저장한다.
+    void vertical_best_z_callback(const std_msgs::msg::Float64::ConstSharedPtr msg)
+    {
+        if (!std::isfinite(msg->data)) {
+            return;
+        }
+        vertical_best_z_m_ = clamp(
+            msg->data, vertical_search_min_z_m_, vertical_search_max_z_m_);
+        have_vertical_best_z_ = true;
+    }
+
+    // [폐루프 상태기계 실행] 비활성·초기 탐색·수직 sweep·homing 상태의 RC 명령을 결정한다.
     void control_loop()
     {
         const rclcpp::Time current_time = now();
@@ -354,14 +390,6 @@ private:
         // 비활성 상태에서는 RC override를 해제하여 수동 조종을 방해하지 않는다.
         if (!control_enabled_ || state_ == State::DISABLED) {
             publish_rc(make_release_override());
-            return;
-        }
-
-        if (state_ == State::ARRIVED) {
-            if (enable_arrival_detection_ && !near_source_is_fresh(current_time)) {
-                transition_to(State::REACQUIRE);
-            }
-            publish_rc(make_rc_override(Command{}));
             return;
         }
 
@@ -374,7 +402,7 @@ private:
             if (have_initial_diagonal_start_ && odometry_is_fresh(current_time) &&
                 traveled_m >= initial_diagonal_distance_m_)
             {
-                // 이 위치부터 새 SNR/gradient/PF 표본을 모으도록 reset한 뒤 원형 탐색을 시작한다.
+                // 대각선 구간에서 누적한 SNR map을 유지한 채 원형 탐색을 시작한다.
                 publish_rc(make_rc_override(Command{}));
                 transition_to(State::INITIAL_SEARCH);
                 return;
@@ -407,10 +435,20 @@ private:
             return;
         }
 
+        if (state_ == State::VERTICAL_SEARCH) {
+            update_vertical_search(current_time);
+            return;
+        }
+
         const bool signal_valid = have_valid_signal(current_time);
 
-        // 실행 분기 B: 초기 탐색 또는 방향 재탐색.
-        if (state_ == State::INITIAL_SEARCH || state_ == State::REACQUIRE) {
+        // 실행 분기 B: 미션 시작 후 최초 방향을 얻기 위한 원형 탐색.
+        if (state_ == State::INITIAL_SEARCH) {
+            if (vertical_search_requested_ && !vertical_search_completed_) {
+                transition_to(State::VERTICAL_SEARCH);
+                publish_rc(make_rc_override(Command{}));
+                return;
+            }
             update_search_acquisition(current_time, signal_valid);
             if (state_ == State::HOMING) {
                 publish_rc(make_rc_override(homing_command()));
@@ -422,36 +460,74 @@ private:
 
         // 실행 분기 C: 유효한 방향을 따라 음원 쪽으로 전진한다.
         if (state_ == State::HOMING && signal_valid) {
-            if (enable_arrival_detection_ && near_source_is_fresh(current_time)) {
-                if (!have_near_source_start_) {
-                    near_source_start_time_ = current_time;
-                    have_near_source_start_ = true;
-                } else if ((current_time - near_source_start_time_).seconds() >= arrived_hold_s_) {
-                    transition_to(State::ARRIVED);
-                    publish_rc(make_rc_override(Command{}));
-                    return;
-                }
-            } else {
-                have_near_source_start_ = false;
-            }
             last_valid_signal_time_ = current_time;
             have_last_valid_signal_time_ = true;
             publish_rc(make_rc_override(homing_command()));
             return;
         }
 
-        // 실행 분기 D: 일시적인 방향 손실 동안 잘못된 방향으로 진행하지 않는다.
+        // 실행 분기 D: 방향 손실 동안 정지하고 hold 이후 자동 재탐색 없이 제어를 해제한다.
         publish_rc(make_rc_override(Command{}));
         if (!have_last_valid_signal_time_) {
             last_valid_signal_time_ = current_time;
             have_last_valid_signal_time_ = true;
         }
         if ((current_time - last_valid_signal_time_).seconds() >= direction_loss_hold_s_) {
-            if (alternate_search_direction_) {
-                search_turn_sign_ *= -1.0;
-            }
-            transition_to(State::REACQUIRE);
+            RCLCPP_ERROR(
+                get_logger(),
+                "Homing direction lost for %.2f s; control disabled.",
+                direction_loss_hold_s_);
+            control_enabled_ = false;
+            transition_to(State::DISABLED);
+            publish_rc(make_release_override());
         }
+    }
+
+    // [수직 Sweep 실행] 위→아래→최고 SNR z 세 목표를 순서대로 추종한다.
+    void update_vertical_search(const rclcpp::Time & current_time)
+    {
+        if ((current_time - state_enter_time_).seconds() >= VERTICAL_SEARCH_TIMEOUT_S) {
+            RCLCPP_ERROR(
+                get_logger(), "Vertical search timed out after %.1f s; control disabled.",
+                VERTICAL_SEARCH_TIMEOUT_S);
+            control_enabled_ = false;
+            transition_to(State::DISABLED);
+            publish_rc(make_release_override());
+            return;
+        }
+
+        double target_z_m = vertical_up_target_z_m_;
+        if (vertical_search_phase_ == VerticalSearchPhase::MOVE_DOWN) {
+            target_z_m = vertical_down_target_z_m_;
+        } else if (vertical_search_phase_ == VerticalSearchPhase::MOVE_BEST) {
+            target_z_m = have_vertical_best_z_ ?
+                vertical_best_z_m_ : vertical_search_start_z_m_;
+        }
+        target_z_m = clamp(
+            target_z_m, vertical_search_min_z_m_, vertical_search_max_z_m_);
+
+        if (std::abs(target_z_m - current_odometry_z_m_) <=
+            VERTICAL_TARGET_TOLERANCE_M)
+        {
+            publish_rc(make_rc_override(Command{}));
+            if (vertical_search_phase_ == VerticalSearchPhase::MOVE_UP) {
+                vertical_search_phase_ = VerticalSearchPhase::MOVE_DOWN;
+            } else if (vertical_search_phase_ == VerticalSearchPhase::MOVE_DOWN) {
+                vertical_search_phase_ = VerticalSearchPhase::MOVE_BEST;
+            } else {
+                vertical_search_completed_ = true;
+                transition_to(State::INITIAL_SEARCH);
+            }
+            return;
+        }
+
+        Command command;
+        // odometry z는 위로 갈수록 증가한다. 기존 heave 축 부호에 맞춰 오차에 음수를 곱한다.
+        command.heave = clamp(
+            -heave_gain_ * (target_z_m - current_odometry_z_m_),
+            -heave_limit_,
+            heave_limit_);
+        publish_rc(make_rc_override(command));
     }
 
     // [탐색 중 신호 획득] 준비되고 안정적인 방향이 일정 시간 유지되면 HOMING으로 전환한다.
@@ -517,13 +593,6 @@ private:
     {
         return estimator_ready_ &&
             (current_time - last_estimator_ready_time_).seconds() <= estimator_ready_timeout_s_;
-    }
-
-    // [근접 상태 freshness] near-source가 true이며 지정 timeout 안에 갱신됐는지 확인한다.
-    bool near_source_is_fresh(const rclcpp::Time & current_time) const
-    {
-        return near_source_ &&
-            (current_time - last_near_source_time_).seconds() <= near_source_timeout_s_;
     }
 
     // [Odometry freshness] 경계 제어가 오래된 위치값으로 계속 진행되지 않도록 수신 시각을 검사한다.
@@ -625,8 +694,10 @@ private:
         const Eigen::Vector2d offset = current_odometry_xy_ - arena_corner_xy_;
         const double raw_x = arena_c * offset.x() + arena_s * offset.y();
         const double arena_x =
-            raw_x + (arena_start_corner_ == "bottom_right" ? arena_width_m_ : 0.0);
-        const double arena_y = -arena_s * offset.x() + arena_c * offset.y();
+            raw_x + (arena_start_corner_ == "bottom_right" ?
+            arena_width_m_ - arena_start_inset_m_ : arena_start_inset_m_);
+        const double arena_y =
+            -arena_s * offset.x() + arena_c * offset.y() + arena_start_inset_m_;
 
         const double yaw_c = std::cos(current_yaw_rad_);
         const double yaw_s = std::sin(current_yaw_rad_);
@@ -701,34 +772,65 @@ private:
         }
     }
 
-    // [제어 상태 전환] 대각선·탐색 진입 상태를 초기화하고 필요한 시점에 추정기 reset을 요청한다.
+    // [제어 상태 전환] 미션 시작에서만 추정기를 완전 초기화하고 탐색 전환에는 map을 유지한다.
     void transition_to(const State next_state)
     {
         if (state_ == next_state) {
             return;
         }
+        if (state_ == State::VERTICAL_SEARCH &&
+            next_state != State::VERTICAL_SEARCH)
+        {
+            publish_vertical_search_active(false);
+        }
         state_ = next_state;
         state_enter_time_ = now();
         have_acquire_start_ = false;
         if (next_state == State::INITIAL_DIAGONAL) {
+            vertical_search_requested_ = false;
+            vertical_search_completed_ = false;
+            have_vertical_best_z_ = false;
             have_initial_diagonal_start_ = false;
             if (have_odometry_) {
                 capture_initial_diagonal_start();
             }
         }
+        if (next_state == State::VERTICAL_SEARCH) {
+            vertical_search_start_z_m_ = current_odometry_z_m_;
+            vertical_up_target_z_m_ = clamp(
+                vertical_search_start_z_m_ + vertical_search_distance_m_,
+                vertical_search_min_z_m_,
+                vertical_search_max_z_m_);
+            vertical_down_target_z_m_ = clamp(
+                vertical_search_start_z_m_ - vertical_search_distance_m_,
+                vertical_search_min_z_m_,
+                vertical_search_max_z_m_);
+            vertical_search_phase_ = VerticalSearchPhase::MOVE_UP;
+            have_vertical_best_z_ = false;
+            publish_vertical_search_active(true);
+        }
         if (next_state == State::INITIAL_DIAGONAL ||
-            next_state == State::INITIAL_SEARCH || next_state == State::REACQUIRE)
+            next_state == State::INITIAL_SEARCH)
         {
             estimator_ready_ = false;
-            near_source_ = false;
-            have_near_source_start_ = false;
             have_direction_ = false;
             have_confidence_ = false;
             bearing_history_.clear();
+        }
+        // enable 상승으로 새 미션을 시작할 때만 장기 SNR map까지 초기화한다.
+        if (next_state == State::INITIAL_DIAGONAL) {
             reset_pub_->publish(std_msgs::msg::Empty{});
         }
         publish_state();
         RCLCPP_INFO(get_logger(), "Homing control state -> %s", state_name(state_));
+    }
+
+    // [수직 탐색 활성 발행] V2가 수평 map 대신 z-SNR 표본을 수집하도록 상태를 알린다.
+    void publish_vertical_search_active(const bool active)
+    {
+        std_msgs::msg::Bool msg;
+        msg.data = active;
+        vertical_search_active_pub_->publish(msg);
     }
 
     // [제어 상태 발행] 현재 enum 상태를 사람이 읽을 수 있는 문자열 토픽으로 내보낸다.
@@ -749,12 +851,10 @@ private:
                 return "INITIAL_DIAGONAL";
             case State::INITIAL_SEARCH:
                 return "INITIAL_SEARCH";
+            case State::VERTICAL_SEARCH:
+                return "VERTICAL_SEARCH";
             case State::HOMING:
                 return "HOMING";
-            case State::REACQUIRE:
-                return "REACQUIRE";
-            case State::ARRIVED:
-                return "ARRIVED";
         }
         return "UNKNOWN";
     }
@@ -802,14 +902,12 @@ private:
     std::string rc_override_topic_;
     std::string rc_preview_topic_;
     std::string estimator_ready_topic_;
-    std::string near_source_topic_;
     std::string reset_topic_;
     std::string odometry_topic_;
     std::string required_direction_frame_;
 
     bool control_enabled_ = false;
     bool dry_run_ = true;
-    bool enable_arrival_detection_ = false;
     double rate_hz_ = 30.0;
     double direction_timeout_s_ = 0.8;
     double confidence_timeout_s_ = 0.8;
@@ -819,23 +917,24 @@ private:
     double direction_loss_hold_s_ = 1.0;
     double direction_stability_window_s_ = 1.0;
     double max_direction_std_rad_ = 0.30;
-    double arrived_hold_s_ = 1.0;
     double estimator_ready_timeout_s_ = 1.0;
-    double near_source_timeout_s_ = 1.0;
     double arena_width_m_ = 15.0;
     double arena_height_m_ = 16.0;
     std::string arena_start_corner_ = "bottom_left";
     double arena_yaw_rad_ = 0.0;
+    double arena_start_inset_m_ = 0.12;
     double geofence_margin_m_ = 0.20;
     double initial_diagonal_distance_m_ = 0.70;
     double initial_diagonal_command_ = 0.30;
     double initial_diagonal_timeout_s_ = 10.0;
     double odometry_timeout_s_ = 0.50;
+    double vertical_search_distance_m_ = 0.50;
+    double vertical_search_min_z_m_ = -1.30;
+    double vertical_search_max_z_m_ = -0.20;
 
     double search_forward_ = 0.30;
     double search_yaw_ = 0.30;
     double search_turn_sign_ = 1.0;
-    bool alternate_search_direction_ = true;
 
     double forward_fast_ = 0.70;
     double forward_mid_ = 0.45;
@@ -861,6 +960,7 @@ private:
     Eigen::Vector2d arena_corner_xy_{0.0, 0.0};
     Eigen::Vector2d initial_diagonal_start_xy_{0.0, 0.0};
     double current_yaw_rad_ = 0.0;
+    double current_odometry_z_m_ = 0.0;
     rclcpp::Time initial_diagonal_start_time_;
     rclcpp::Time last_odometry_receive_time_;
     bool have_odometry_ = false;
@@ -876,23 +976,29 @@ private:
     bool have_direction_ = false;
     bool have_confidence_ = false;
     bool estimator_ready_ = false;
-    bool near_source_ = false;
-    bool have_near_source_start_ = false;
-    rclcpp::Time near_source_start_time_;
     rclcpp::Time last_estimator_ready_time_;
-    rclcpp::Time last_near_source_time_;
     std::deque<std::pair<rclcpp::Time, double>> bearing_history_;
+    VerticalSearchPhase vertical_search_phase_ = VerticalSearchPhase::MOVE_UP;
+    bool vertical_search_requested_ = false;
+    bool vertical_search_completed_ = false;
+    double vertical_search_start_z_m_ = 0.0;
+    double vertical_up_target_z_m_ = 0.0;
+    double vertical_down_target_z_m_ = 0.0;
+    double vertical_best_z_m_ = 0.0;
+    bool have_vertical_best_z_ = false;
 
     rclcpp::Subscription<geometry_msgs::msg::Vector3Stamped>::SharedPtr direction_sub_;
     rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr confidence_sub_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr enable_sub_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr estimator_ready_sub_;
-    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr near_source_sub_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odometry_sub_;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr vertical_search_request_sub_;
+    rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr vertical_best_z_sub_;
     rclcpp::Publisher<mavros_msgs::msg::OverrideRCIn>::SharedPtr rc_pub_;
     rclcpp::Publisher<mavros_msgs::msg::OverrideRCIn>::SharedPtr rc_preview_pub_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr state_pub_;
     rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr reset_pub_;
+    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr vertical_search_active_pub_;
     rclcpp::TimerBase::SharedPtr timer_;
 };
 }
