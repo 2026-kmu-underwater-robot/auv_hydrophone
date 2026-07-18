@@ -22,13 +22,11 @@
 namespace audio_capture
 {
 // SNR gradient 전용 제어 흐름:
-//   DISABLED
-//      enable=true
-//          -> INITIAL_DIAGONAL: 모서리에서 경기장 중심 방향으로 대각선 이동
-//          -> INITIAL_SEARCH: 전진+yaw 명령으로 원형/호 궤적 생성
-//          -> VERTICAL_SEARCH: SNR 10 dB 지속 시 위·아래 sweep 후 최고 SNR z로 이동
-//          -> HOMING: 유효한 방향과 신뢰도가 일정 시간 유지되면 음원 방향 추종
-//          -> DISABLED: 방향을 일정 시간 잃으면 자동 재탐색 없이 안전하게 제어 해제
+//   INITIAL_DIAGONAL: 모서리에서 경기장 중심 방향으로 대각선 이동
+//       -> INITIAL_SEARCH: 전진+yaw 명령으로 원형/호 궤적 생성
+//       -> VERTICAL_SEARCH: SNR 10 dB 지속 시 위·아래 sweep 후 최고 SNR z로 이동
+//       -> HOMING: 유효한 방향과 신뢰도가 일정 시간 유지되면 음원 방향 추종
+//       -> INITIAL_SEARCH: 방향 손실이나 탐색 timeout 시 자동 재탐색
 class SnrGradientHomingControllerNode : public rclcpp::Node
 {
 public:
@@ -42,8 +40,6 @@ public:
             declare_parameter<std::string>("direction_topic", "/homing/direction");
         confidence_topic_ =
             declare_parameter<std::string>("confidence_topic", "/homing/snr_confidence");
-        enable_topic_ =
-            declare_parameter<std::string>("enable_topic", "/homing/control_enable");
         state_topic_ =
             declare_parameter<std::string>("state_topic", "/homing/control_state");
         estimator_ready_topic_ =
@@ -59,15 +55,13 @@ public:
             declare_parameter<std::string>("required_direction_frame", "base_link");
 
         // 상태 전환과 방향 유효성 설정.
-        control_enabled_ = declare_parameter<bool>("control_enabled", false);
-        dry_run_ = declare_parameter<bool>("dry_run", true);
         rate_hz_ = clamp(declare_parameter<double>("rate_hz", 30.0), 1.0, 120.0);
         direction_timeout_s_ =
             clamp(declare_parameter<double>("direction_timeout_s", 0.8), 0.05, 10.0);
         confidence_timeout_s_ =
             clamp(declare_parameter<double>("confidence_timeout_s", 0.8), 0.05, 10.0);
         min_direction_confidence_ =
-            clamp(declare_parameter<double>("min_direction_confidence", 0.15), 0.0, 1.0);
+            clamp(declare_parameter<double>("min_direction_confidence", 0.05), 0.0, 1.0);
         acquire_hold_s_ =
             clamp(declare_parameter<double>("acquire_hold_s", 1.0), 0.0, 30.0);
         search_min_duration_s_ =
@@ -165,13 +159,6 @@ public:
                 &SnrGradientHomingControllerNode::confidence_callback,
                 this,
                 std::placeholders::_1));
-        enable_sub_ = create_subscription<std_msgs::msg::Bool>(
-            enable_topic_,
-            10,
-            std::bind(
-                &SnrGradientHomingControllerNode::enable_callback,
-                this,
-                std::placeholders::_1));
         estimator_ready_sub_ = create_subscription<std_msgs::msg::Bool>(
             estimator_ready_topic_, 10,
             std::bind(&SnrGradientHomingControllerNode::estimator_ready_callback, this, std::placeholders::_1));
@@ -204,13 +191,8 @@ public:
             rclcpp::QoS(1).reliable().transient_local());
         publish_vertical_search_active(false);
 
-        state_ = State::DISABLED;
         state_enter_time_ = now();
-        if (control_enabled_) {
-            transition_to(State::INITIAL_DIAGONAL);
-        } else {
-            publish_state();
-        }
+        transition_to(State::INITIAL_DIAGONAL, true);
 
         const auto period = std::chrono::duration<double>(1.0 / rate_hz_);
         timer_ = create_wall_timer(
@@ -219,9 +201,7 @@ public:
 
         RCLCPP_INFO(
             get_logger(),
-            "SNR gradient controller ready. enabled=%s dry_run=%s direction=%s frame=%s rc=%s preview=%s",
-            control_enabled_ ? "true" : "false",
-            dry_run_ ? "true" : "false",
+            "SNR gradient controller ready. direction=%s frame=%s rc=%s preview=%s",
             direction_topic_.c_str(),
             required_direction_frame_.c_str(),
             rc_override_topic_.c_str(),
@@ -243,7 +223,6 @@ private:
 
     enum class State
     {
-        DISABLED,
         INITIAL_DIAGONAL,
         INITIAL_SEARCH,
         VERTICAL_SEARCH,
@@ -340,24 +319,6 @@ private:
         have_confidence_ = true;
     }
 
-    // [제어 enable 수신] 활성화하면 모서리 이탈 대각선 이동, 비활성화하면 RC 해제로 전환한다.
-    void enable_callback(const std_msgs::msg::Bool::ConstSharedPtr msg)
-    {
-        if (msg->data == control_enabled_) {
-            return;
-        }
-
-        control_enabled_ = msg->data;
-        have_acquire_start_ = false;
-        have_last_valid_signal_time_ = false;
-        if (control_enabled_) {
-            // enable 상승 시 항상 모서리 이탈 대각선 이동부터 새 순서를 시작한다.
-            transition_to(State::INITIAL_DIAGONAL);
-        } else {
-            transition_to(State::DISABLED);
-        }
-    }
-
     // [추정기 준비 상태 수신] V2 robust gradient 방향 사용 가능 여부와 최신 수신 시각을 기록한다.
     void estimator_ready_callback(const std_msgs::msg::Bool::ConstSharedPtr msg)
     {
@@ -387,12 +348,6 @@ private:
     {
         const rclcpp::Time current_time = now();
 
-        // 비활성 상태에서는 RC override를 해제하여 수동 조종을 방해하지 않는다.
-        if (!control_enabled_ || state_ == State::DISABLED) {
-            publish_rc(make_release_override());
-            return;
-        }
-
         // 실행 분기 A: 시작 모서리에서 경기장 중심 방향으로 목표 거리만큼 대각선 이동한다.
         if (state_ == State::INITIAL_DIAGONAL) {
             double traveled_m = 0.0;
@@ -411,14 +366,13 @@ private:
                 have_initial_diagonal_start_ ? initial_diagonal_start_time_ : state_enter_time_;
             if ((current_time - timeout_start).seconds() >= initial_diagonal_timeout_s_)
             {
-                RCLCPP_ERROR(
+                RCLCPP_WARN(
                     get_logger(),
-                    "Initial diagonal timed out at %.2f/%.2f m; control disabled.",
+                    "Initial diagonal timed out at %.2f/%.2f m; starting signal search.",
                     traveled_m,
                     initial_diagonal_distance_m_);
-                control_enabled_ = false;
-                transition_to(State::DISABLED);
-                publish_rc(make_release_override());
+                publish_rc(make_rc_override(Command{}));
+                transition_to(State::INITIAL_SEARCH);
                 return;
             }
             if (!have_initial_diagonal_start_ || !odometry_is_fresh(current_time)) {
@@ -466,20 +420,18 @@ private:
             return;
         }
 
-        // 실행 분기 D: 방향 손실 동안 정지하고 hold 이후 자동 재탐색 없이 제어를 해제한다.
+        // 실행 분기 D: 방향 손실 동안 정지하고 hold 이후 원형 탐색으로 자동 복귀한다.
         publish_rc(make_rc_override(Command{}));
         if (!have_last_valid_signal_time_) {
             last_valid_signal_time_ = current_time;
             have_last_valid_signal_time_ = true;
         }
         if ((current_time - last_valid_signal_time_).seconds() >= direction_loss_hold_s_) {
-            RCLCPP_ERROR(
+            RCLCPP_WARN(
                 get_logger(),
-                "Homing direction lost for %.2f s; control disabled.",
+                "Homing direction lost for %.2f s; returning to signal search.",
                 direction_loss_hold_s_);
-            control_enabled_ = false;
-            transition_to(State::DISABLED);
-            publish_rc(make_release_override());
+            transition_to(State::INITIAL_SEARCH);
         }
     }
 
@@ -487,12 +439,13 @@ private:
     void update_vertical_search(const rclcpp::Time & current_time)
     {
         if ((current_time - state_enter_time_).seconds() >= VERTICAL_SEARCH_TIMEOUT_S) {
-            RCLCPP_ERROR(
-                get_logger(), "Vertical search timed out after %.1f s; control disabled.",
+            RCLCPP_WARN(
+                get_logger(), "Vertical search timed out after %.1f s; returning to signal search.",
                 VERTICAL_SEARCH_TIMEOUT_S);
-            control_enabled_ = false;
-            transition_to(State::DISABLED);
-            publish_rc(make_release_override());
+            // 동일한 latched 요청으로 즉시 수직 탐색에 재진입하지 않도록 이번 시도를 종료 처리한다.
+            vertical_search_completed_ = true;
+            publish_rc(make_rc_override(Command{}));
+            transition_to(State::INITIAL_SEARCH);
             return;
         }
 
@@ -754,28 +707,17 @@ private:
         return msg;
     }
 
-    // [RC override 해제 생성] 모든 채널을 CHAN_RELEASE로 채워 autopilot/수동 제어권을 돌려준다.
-    mavros_msgs::msg::OverrideRCIn make_release_override() const
-    {
-        mavros_msgs::msg::OverrideRCIn msg;
-        msg.channels.fill(mavros_msgs::msg::OverrideRCIn::CHAN_RELEASE);
-        return msg;
-    }
-
-    // [RC 명령 발행] preview는 항상 발행하고 dry-run이 아닐 때만 실제 MAVROS로 전송한다.
+    // [RC 명령 발행] 진단 preview와 실제 MAVROS override를 항상 함께 전송한다.
     void publish_rc(const mavros_msgs::msg::OverrideRCIn & msg)
     {
-        // preview는 항상 발행해 dry-run과 실기에서 동일한 명령을 비교할 수 있다.
         rc_preview_pub_->publish(msg);
-        if (!dry_run_) {
-            rc_pub_->publish(msg);
-        }
+        rc_pub_->publish(msg);
     }
 
     // [제어 상태 전환] 미션 시작에서만 추정기를 완전 초기화하고 탐색 전환에는 map을 유지한다.
-    void transition_to(const State next_state)
+    void transition_to(const State next_state, const bool force = false)
     {
-        if (state_ == next_state) {
+        if (!force && state_ == next_state) {
             return;
         }
         if (state_ == State::VERTICAL_SEARCH &&
@@ -817,7 +759,7 @@ private:
             have_confidence_ = false;
             bearing_history_.clear();
         }
-        // enable 상승으로 새 미션을 시작할 때만 장기 SNR map까지 초기화한다.
+        // 노드 시작으로 새 미션을 구성할 때만 장기 SNR map까지 초기화한다.
         if (next_state == State::INITIAL_DIAGONAL) {
             reset_pub_->publish(std_msgs::msg::Empty{});
         }
@@ -845,8 +787,6 @@ private:
     static const char * state_name(const State state)
     {
         switch (state) {
-            case State::DISABLED:
-                return "DISABLED";
             case State::INITIAL_DIAGONAL:
                 return "INITIAL_DIAGONAL";
             case State::INITIAL_SEARCH:
@@ -897,7 +837,6 @@ private:
 
     std::string direction_topic_;
     std::string confidence_topic_;
-    std::string enable_topic_;
     std::string state_topic_;
     std::string rc_override_topic_;
     std::string rc_preview_topic_;
@@ -906,12 +845,10 @@ private:
     std::string odometry_topic_;
     std::string required_direction_frame_;
 
-    bool control_enabled_ = false;
-    bool dry_run_ = true;
     double rate_hz_ = 30.0;
     double direction_timeout_s_ = 0.8;
     double confidence_timeout_s_ = 0.8;
-    double min_direction_confidence_ = 0.15;
+    double min_direction_confidence_ = 0.05;
     double acquire_hold_s_ = 1.0;
     double search_min_duration_s_ = 6.0;
     double direction_loss_hold_s_ = 1.0;
@@ -950,7 +887,7 @@ private:
     bool invert_rc_yaw_ = true;
     bool invert_rc_lateral_ = false;
 
-    State state_ = State::DISABLED;
+    State state_ = State::INITIAL_DIAGONAL;
     rclcpp::Time state_enter_time_;
     rclcpp::Time acquire_start_time_;
     bool have_acquire_start_ = false;
@@ -989,7 +926,6 @@ private:
 
     rclcpp::Subscription<geometry_msgs::msg::Vector3Stamped>::SharedPtr direction_sub_;
     rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr confidence_sub_;
-    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr enable_sub_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr estimator_ready_sub_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odometry_sub_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr vertical_search_request_sub_;

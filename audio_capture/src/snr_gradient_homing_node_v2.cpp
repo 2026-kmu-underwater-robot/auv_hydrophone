@@ -22,11 +22,9 @@
 #include <std_msgs/msg/empty.hpp>
 #include <std_msgs/msg/float64.hpp>
 
-
+// 실행 예:
 // ros2 launch audio_capture snr_gradient_homing_control.launch.py \
-//   controller_dry_run:=false \
-//   arena_start_corner:=bottom_right \
-//   arena_yaw_rad:=3.141592653589793
+//   arena_start_corner:=bottom_right arena_yaw_rad:=3.141592653589793
 
 
 namespace audio_capture
@@ -152,8 +150,8 @@ private:
     static constexpr double MIN_RESIDUAL_SCALE_DB = 0.10;
     static constexpr double MIN_GRADIENT_DB_PER_M = 0.05;
     static constexpr double MIN_COVERAGE_RATIO = 0.035;
-    static constexpr double MIN_OUTPUT_CONFIDENCE = 0.12;
-    static constexpr double READY_CONFIDENCE = 0.28;
+    static constexpr double MIN_OUTPUT_CONFIDENCE = 0.03;
+    static constexpr double READY_CONFIDENCE = 0.08;
     static constexpr double MAX_STABLE_STD_RAD = 0.40;
     static constexpr double DIRECTION_HISTORY_MAX_AGE_S = 2.0;
     static constexpr double FUSION_MIN_DOT = 0.50;

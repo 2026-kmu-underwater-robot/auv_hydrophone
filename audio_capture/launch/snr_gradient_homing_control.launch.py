@@ -24,8 +24,6 @@ def generate_launch_description():
     map_cell_size_m = LaunchConfiguration("map_cell_size_m")
     local_radius_m = LaunchConfiguration("local_radius_m")
     map_radius_m = LaunchConfiguration("map_radius_m")
-    control_enabled = LaunchConfiguration("control_enabled")
-    controller_dry_run = LaunchConfiguration("controller_dry_run")
     geofence_margin_m = LaunchConfiguration("geofence_margin_m")
     initial_diagonal_distance_m = LaunchConfiguration("initial_diagonal_distance_m")
     initial_diagonal_command = LaunchConfiguration("initial_diagonal_command")
@@ -54,7 +52,7 @@ def generate_launch_description():
         DeclareLaunchArgument("depth_topic", default_value="/depth/pose"),
         DeclareLaunchArgument(
             "reference_frequency_hz",
-            default_value="21164.0",
+            default_value="21134.0",
             description="예상 pinger 주파수(Hz).",
         ),
         DeclareLaunchArgument(
@@ -101,16 +99,6 @@ def generate_launch_description():
             "map_radius_m",
             default_value="2.0",
             description="격자 median SNR map gradient의 공간 반경(m).",
-        ),
-        DeclareLaunchArgument(
-            "control_enabled",
-            default_value="false",
-            description="true이면 모서리 이탈 대각선 이동 후 초기 원형 탐색을 시작한다.",
-        ),
-        DeclareLaunchArgument(
-            "controller_dry_run",
-            default_value="true",
-            description="true이면 preview만 발행하고 실제 MAVROS RC override는 발행하지 않는다.",
         ),
         DeclareLaunchArgument(
             "geofence_margin_m",
@@ -215,8 +203,6 @@ def generate_launch_description():
                 parameters=[
                     {
                         "use_sim_time": ParameterValue(use_sim_time, value_type=bool),
-                        "control_enabled": ParameterValue(control_enabled, value_type=bool),
-                        "dry_run": ParameterValue(controller_dry_run, value_type=bool),
                         "odometry_topic": odometry_topic,
                         "arena_width_m": ParameterValue(
                             arena_width_m, value_type=float
