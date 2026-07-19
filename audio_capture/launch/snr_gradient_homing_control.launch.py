@@ -82,7 +82,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "arena_start_corner",
-            default_value="bottom_left",
+            default_value="bottom_right",
             description="AUV 시작 모서리: bottom_left 또는 bottom_right.",
         ),
         DeclareLaunchArgument(
