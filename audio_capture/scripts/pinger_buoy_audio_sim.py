@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Publish bag-derived hydrophone noise with a position-dependent pinger tone."""
+"""Publish a position-dependent pinger tone over clean or recorded background."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from pathlib import Path
 
 import numpy as np
 import rclpy
+from scipy import signal
 from audio_common_msgs.msg import AudioData, AudioDataStamped, AudioInfo
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
@@ -20,15 +21,35 @@ from rosbag2_py import ConverterOptions, SequentialReader, StorageOptions
 INT32_SCALE = 2147483648.0
 INT32_MIN = np.iinfo(np.int32).min
 INT32_MAX = np.iinfo(np.int32).max
+DETECTOR_TARGET_FREQUENCIES_HZ = (21164.0, 27211.0)
+BACKGROUND_NOTCH_HALF_WIDTH_HZ = 200.0
 
 
 def distance_attenuated_amplitude(
     source_amplitude: float,
     distance_m: float,
     minimum_distance_m: float,
+    attenuation_power: float,
 ) -> float:
-    """Return spherical-spreading amplitude with a near-source cap."""
-    return source_amplitude / max(distance_m, minimum_distance_m)
+    """Return monotonic distance attenuation with a near-source cap."""
+    distance_scale = minimum_distance_m / max(distance_m, minimum_distance_m)
+    return source_amplitude * distance_scale**attenuation_power
+
+
+def make_white_noise_pcm(
+    frames: int,
+    channels: int,
+    amplitude: float,
+    random_generator: np.random.Generator,
+) -> bytes:
+    """Return reproducible S32LE white noise with distance-independent power."""
+    noise = random_generator.normal(0.0, amplitude, (frames, channels))
+    noise_i32 = np.clip(
+        np.rint(np.clip(noise, -1.0, 1.0) * INT32_SCALE),
+        INT32_MIN,
+        INT32_MAX,
+    ).astype("<i4")
+    return noise_i32.reshape(-1).tobytes()
 
 
 def mix_pinger_tone(
@@ -39,6 +60,7 @@ def mix_pinger_tone(
     source_amplitude: float,
     distance_m: float,
     minimum_distance_m: float,
+    attenuation_power: float,
     sound_speed_mps: float,
     first_sample_index: int,
 ) -> bytes:
@@ -54,7 +76,7 @@ def mix_pinger_tone(
     emission_time_s = frame_indices / float(sample_rate_hz)
     propagation_delay_s = distance_m / sound_speed_mps
     amplitude = distance_attenuated_amplitude(
-        source_amplitude, distance_m, minimum_distance_m
+        source_amplitude, distance_m, minimum_distance_m, attenuation_power
     )
     tone = amplitude * np.sin(
         2.0 * math.pi * frequency_hz * (emission_time_s - propagation_delay_s)
@@ -65,6 +87,46 @@ def mix_pinger_tone(
     ).astype("<i4")
     trailing = pcm[valid_sample_count * np.dtype("<i4").itemsize :]
     return mixed_i32.reshape(-1).tobytes() + trailing
+
+
+class BackgroundNotchFilter:
+    """Remove recorded pinger bands before adding the synthetic source."""
+
+    def __init__(self, sample_rate_hz: int, channels: int) -> None:
+        nyquist_hz = 0.5 * float(sample_rate_hz)
+        sections = []
+        for frequency_hz in DETECTOR_TARGET_FREQUENCIES_HZ:
+            low_hz = frequency_hz - BACKGROUND_NOTCH_HALF_WIDTH_HZ
+            high_hz = frequency_hz + BACKGROUND_NOTCH_HALF_WIDTH_HZ
+            sections.append(
+                signal.butter(
+                    4,
+                    [low_hz / nyquist_hz, high_hz / nyquist_hz],
+                    btype="bandstop",
+                    output="sos",
+                )
+            )
+        self.sos = np.vstack(sections)
+        self.state = np.zeros((channels, self.sos.shape[0], 2), dtype=np.float64)
+
+    def process(self, pcm: bytes, channels: int) -> bytes:
+        samples = np.frombuffer(pcm, dtype="<i4")
+        valid_sample_count = (samples.size // channels) * channels
+        if valid_sample_count == 0:
+            return pcm
+        frames = samples[:valid_sample_count].reshape(-1, channels).astype(np.float64)
+        frames /= INT32_SCALE
+        for channel in range(channels):
+            frames[:, channel], self.state[channel] = signal.sosfilt(
+                self.sos, frames[:, channel], zi=self.state[channel]
+            )
+        filtered = np.clip(
+            np.rint(np.clip(frames, -1.0, 1.0) * INT32_SCALE),
+            INT32_MIN,
+            INT32_MAX,
+        ).astype("<i4")
+        trailing = pcm[valid_sample_count * np.dtype("<i4").itemsize :]
+        return filtered.reshape(-1).tobytes() + trailing
 
 
 class NoiseBagReader:
@@ -135,6 +197,9 @@ class PingerBuoyAudioSim(Node):
         odometry_topic = self.declare_parameter(
             "odometry_topic", "/odometry/filtered"
         ).value
+        self.signal_mode = str(
+            self.declare_parameter("signal_mode", "noisy").value
+        ).strip().lower()
 
         self.sample_rate_hz = int(
             self.declare_parameter("sample_rate_hz", 96000).value
@@ -152,13 +217,22 @@ class PingerBuoyAudioSim(Node):
         self.source_amplitude = float(
             self.declare_parameter("source_amplitude", 0.03).value
         )
+        self.clean_noise_amplitude = float(
+            self.declare_parameter("clean_noise_amplitude", 0.001).value
+        )
+        clean_noise_seed = int(
+            self.declare_parameter("clean_noise_seed", 7).value
+        )
         self.minimum_distance_m = float(
             self.declare_parameter("minimum_distance_m", 0.5).value
         )
+        self.attenuation_power = float(
+            self.declare_parameter("attenuation_power", 2.0).value
+        )
         self.pinger_position = np.array(
             [
-                float(self.declare_parameter("pinger_x", 2.5).value),
-                float(self.declare_parameter("pinger_y", 1.4).value),
+                float(self.declare_parameter("pinger_x", -2.0).value),
+                float(self.declare_parameter("pinger_y", 0.65).value),
                 float(self.declare_parameter("pinger_z", -0.5).value),
             ],
             dtype=np.float64,
@@ -170,15 +244,32 @@ class PingerBuoyAudioSim(Node):
             raise ValueError("frames_per_message must be positive")
         if self.frequency_hz <= 0.0 or self.frequency_hz >= 0.5 * self.sample_rate_hz:
             raise ValueError("frequency_hz must be between zero and Nyquist")
-        if self.sound_speed_mps <= 0.0 or self.minimum_distance_m <= 0.0:
-            raise ValueError("sound_speed_mps and minimum_distance_m must be positive")
-        if self.source_amplitude < 0.0:
-            raise ValueError("source_amplitude must be non-negative")
+        if (
+            self.sound_speed_mps <= 0.0
+            or self.minimum_distance_m <= 0.0
+            or self.attenuation_power <= 0.0
+        ):
+            raise ValueError(
+                "sound_speed_mps, minimum_distance_m and attenuation_power must be positive"
+            )
+        if self.source_amplitude < 0.0 or self.clean_noise_amplitude < 0.0:
+            raise ValueError(
+                "source_amplitude and clean_noise_amplitude must be non-negative"
+            )
+        if self.signal_mode not in {"noisy", "clean"}:
+            raise ValueError("signal_mode must be either 'noisy' or 'clean'")
 
-        self.noise_reader = NoiseBagReader(str(bag_path), str(noise_topic))
         self.auv_position: np.ndarray | None = None
         self.first_sample_index = 0
         self.expected_pcm_bytes = self.frames_per_message * self.channels * 4
+        self.clean_noise_generator = np.random.default_rng(clean_noise_seed)
+        self.noise_reader: NoiseBagReader | None = None
+        self.background_filter: BackgroundNotchFilter | None = None
+        if self.signal_mode == "noisy":
+            self.noise_reader = NoiseBagReader(str(bag_path), str(noise_topic))
+            self.background_filter = BackgroundNotchFilter(
+                self.sample_rate_hz, self.channels
+            )
 
         self.audio_pub = self.create_publisher(AudioData, str(audio_topic), 10)
         self.stamped_pub = self.create_publisher(
@@ -197,11 +288,17 @@ class PingerBuoyAudioSim(Node):
         self.publish_audio_info()
         period_s = self.frames_per_message / float(self.sample_rate_hz)
         self.timer = self.create_timer(period_s, self.publish_audio)
+        background = (
+            f"noise={self.noise_reader.bag_path}"
+            if self.noise_reader is not None
+            else f"clean_noise={self.clean_noise_amplitude:.4f}"
+        )
         self.get_logger().info(
             f"Pinger buoy audio sim ready: {self.frequency_hz:.1f} Hz at "
             f"({self.pinger_position[0]:.2f}, {self.pinger_position[1]:.2f}, "
-            f"{self.pinger_position[2]:.2f}), noise={self.noise_reader.bag_path}, "
-            f"chunk={self.frames_per_message} frames."
+            f"{self.pinger_position[2]:.2f}), mode={self.signal_mode}, "
+            f"attenuation=distance^-{self.attenuation_power:.1f}, "
+            f"{background}, chunk={self.frames_per_message} frames."
         )
 
     def odometry_callback(self, message: Odometry) -> None:
@@ -221,11 +318,20 @@ class PingerBuoyAudioSim(Node):
 
     def publish_audio(self) -> None:
         try:
-            pcm = self.noise_reader.next_audio_bytes()
-            if len(pcm) != self.expected_pcm_bytes:
-                raise RuntimeError(
-                    f"noise chunk has {len(pcm)} bytes; "
-                    f"expected {self.expected_pcm_bytes}"
+            if self.signal_mode == "noisy":
+                pcm = self.noise_reader.next_audio_bytes()
+                if len(pcm) != self.expected_pcm_bytes:
+                    raise RuntimeError(
+                        f"noise chunk has {len(pcm)} bytes; "
+                        f"expected {self.expected_pcm_bytes}"
+                    )
+                pcm = self.background_filter.process(pcm, self.channels)
+            else:
+                pcm = make_white_noise_pcm(
+                    self.frames_per_message,
+                    self.channels,
+                    self.clean_noise_amplitude,
+                    self.clean_noise_generator,
                 )
 
             if self.auv_position is not None:
@@ -240,6 +346,7 @@ class PingerBuoyAudioSim(Node):
                     source_amplitude=self.source_amplitude,
                     distance_m=distance_m,
                     minimum_distance_m=self.minimum_distance_m,
+                    attenuation_power=self.attenuation_power,
                     sound_speed_mps=self.sound_speed_mps,
                     first_sample_index=self.first_sample_index,
                 )
