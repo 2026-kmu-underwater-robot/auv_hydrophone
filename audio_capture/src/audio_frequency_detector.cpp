@@ -217,21 +217,14 @@ class AudioFrequencyDetectorNode : public rclcpp::Node
             locked_frequency_pub_->publish(frequency_msg);
         }
 
-        const std::string lock_detail =
-            locked_on_ ? ", locked_freq: " + std::to_string(locked_frequency_hz_) + " Hz" : "";
-
         RCLCPP_INFO_THROTTLE(
             this->get_logger(),
             *this->get_clock(),
             1000,
-            "target %.0f Hz peak: %.1f Hz, mag: %.6f, noise: %.6f, snr: %.1f dB, lock: %s%s",
+            "[SIGNAL] target=%.0f Hz frequency=%.1f Hz SNR=%.1f dB",
             peak_target_frequency_hz,
             peak_frequency_hz,
-            peak_magnitude,
-            noise_floor,
-            snr_db,
-            locked_on_ ? "true" : "false",
-            lock_detail.c_str());
+            snr_db);
     }
 
     double calculate_median(std::vector<double> values) const
