@@ -10,6 +10,7 @@
 #include <thread>
 #include <vector>
 
+#include <fcntl.h>
 #include <sys/select.h>
 #include <termios.h>
 #include <unistd.h>
@@ -1063,39 +1064,47 @@ private:
 
     void keyboard_loop()
     {
+        const int terminal_fd = open("/dev/tty", O_RDONLY | O_NONBLOCK);
+        if (terminal_fd < 0) {
+            RCLCPP_WARN(
+                get_logger(),
+                "[EMERGENCY] keyboard disabled: cannot open controlling terminal");
+            return;
+        }
+
         termios original_termios;
         bool restore_terminal = false;
-        if (isatty(STDIN_FILENO) &&
-            tcgetattr(STDIN_FILENO, &original_termios) == 0)
+        if (tcgetattr(terminal_fd, &original_termios) == 0)
         {
             termios raw_termios = original_termios;
             raw_termios.c_lflag &= static_cast<tcflag_t>(~(ICANON | ECHO));
             raw_termios.c_cc[VMIN] = 0;
             raw_termios.c_cc[VTIME] = 0;
             restore_terminal =
-                tcsetattr(STDIN_FILENO, TCSANOW, &raw_termios) == 0;
+                tcsetattr(terminal_fd, TCSANOW, &raw_termios) == 0;
         }
 
         while (rclcpp::ok() && !stop_keyboard_thread_.load()) {
             fd_set read_fds;
             FD_ZERO(&read_fds);
-            FD_SET(STDIN_FILENO, &read_fds);
+            FD_SET(terminal_fd, &read_fds);
             timeval timeout{0, 100000};
             const int ready = select(
-                STDIN_FILENO + 1, &read_fds, nullptr, nullptr, &timeout);
-            if (ready <= 0 || !FD_ISSET(STDIN_FILENO, &read_fds)) {
+                terminal_fd + 1, &read_fds, nullptr, nullptr, &timeout);
+            if (ready <= 0 || !FD_ISSET(terminal_fd, &read_fds)) {
                 continue;
             }
             char input = '\0';
-            if (read(STDIN_FILENO, &input, 1) == 1 &&
+            if (read(terminal_fd, &input, 1) == 1 &&
                 input == emergency_stop_key_.front())
             {
                 trigger_emergency_stop();
             }
         }
         if (restore_terminal) {
-            tcsetattr(STDIN_FILENO, TCSANOW, &original_termios);
+            tcsetattr(terminal_fd, TCSANOW, &original_termios);
         }
+        close(terminal_fd);
     }
 
     std::uint16_t axis_pwm(const double value, const bool invert) const
