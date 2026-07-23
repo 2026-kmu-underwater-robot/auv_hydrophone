@@ -45,11 +45,13 @@ public:
         const auto homing_direction_topic = declare_parameter<std::string>(
             "homing_direction_topic", "/homing/homing_direction");
         const auto waypoint_topic = declare_parameter<std::string>(
-            "waypoint_topic", "/homing/current_waypoint");
+            "waypoint_topic", "/waypoint");
         const auto scan_center_topic = declare_parameter<std::string>(
             "scan_center_topic", "/homing/scan_center");
         const auto marker_topic = declare_parameter<std::string>(
             "marker_topic", "/homing/rviz/markers");
+        arena_frame_id_ = declare_parameter<std::string>(
+            "arena_frame_id", "arena");
 
         arena_length_m_ = std::max(
             0.1, declare_parameter<double>("arena_length_m", 15.0));
@@ -122,7 +124,11 @@ public:
         waypoint_sub_ = create_subscription<geometry_msgs::msg::PointStamped>(
             waypoint_topic, rclcpp::QoS(1).reliable().transient_local(),
             [this](const geometry_msgs::msg::PointStamped::ConstSharedPtr msg) {
-                const Eigen::Vector2d waypoint(msg->point.x, msg->point.y);
+                Eigen::Vector2d waypoint(msg->point.x, msg->point.y);
+                if (msg->header.frame_id == arena_frame_id_) {
+                    waypoint.x() += arena_offset_x_m_;
+                    waypoint.y() += arena_offset_y_m_;
+                }
                 if (waypoint.allFinite()) {
                     current_waypoint_ = waypoint;
                     have_waypoint_ = true;
@@ -769,6 +775,7 @@ private:
     bool have_scan_center_ = false;
     std::string odometry_frame_ = "odom";
     std::string arena_start_corner_ = "bottom_left";
+    std::string arena_frame_id_ = "arena";
     Eigen::Vector2d current_position_{0.0, 0.0};
     Eigen::Vector2d current_waypoint_{0.0, 0.0};
     Eigen::Vector2d scan_center_{0.0, 0.0};

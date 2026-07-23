@@ -29,6 +29,7 @@ add_library(${PROJECT_NAME} SHARED
   src/snr_gradient_homing_controller_node.cpp
   src/region_local_gradient_estimator.cpp
   src/waypoint_homing_controller.cpp
+  src/near_zone_line_search_controller.cpp
   src/region_local_gradient_rviz_visualizer.cpp
   src/sim_odometry_rebaser.cpp
   src/homing_controller_node.cpp
@@ -131,6 +132,12 @@ rclcpp_components_register_node(
 
 rclcpp_components_register_node(
   ${PROJECT_NAME}
+  PLUGIN "audio_capture::NearZoneLineSearchControllerNode"
+  EXECUTABLE near_zone_line_search_controller
+)
+
+rclcpp_components_register_node(
+  ${PROJECT_NAME}
   PLUGIN "audio_capture::RegionLocalGradientRvizVisualizerNode"
   EXECUTABLE region_local_gradient_rviz_visualizer
 )
@@ -171,6 +178,7 @@ install(TARGETS
   snr_gradient_homing_controller
   region_local_gradient_estimator
   waypoint_homing_controller
+  near_zone_line_search_controller
   region_local_gradient_rviz_visualizer
   sim_odometry_rebaser
   homing_controller

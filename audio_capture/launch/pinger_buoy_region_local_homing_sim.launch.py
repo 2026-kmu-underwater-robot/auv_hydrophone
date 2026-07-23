@@ -3,7 +3,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
@@ -25,6 +25,7 @@ def generate_launch_description():
     sound_speed_mps = LaunchConfiguration("sound_speed_mps")
     sim_arena_yaw_rad = LaunchConfiguration("sim_arena_yaw_rad")
     launch_rviz = LaunchConfiguration("launch_rviz")
+    controller_mode = LaunchConfiguration("controller_mode")
 
     # 현재 활성값은 15 x 16 x 11 m 대회장용이다.
     #
@@ -80,23 +81,12 @@ def generate_launch_description():
         ("rolling_gradient_alpha", "0.15"),
         ("rolling_gradient_conflict_angle_rad", "1.0472"),
         ("waypoint_reach_tolerance_m", "0.15"),
-        ("scan_radial_kp", "1.5"),
-        ("scan_radial_ki", "0.05"),
-        ("scan_radial_kd", "0.3"),
-        ("scan_radial_integral_limit", "1.0"),
+        ("scan_waypoint_lookahead_rad", "0.35"),
         ("region_sample_spacing_m", "0.15"),
         ("min_region_gradient_magnitude", "0.05"),
         ("min_region_lateral_spread_m", "0.10"),
         ("vision_near_zone_width_m", "0.60"),
         # ("vision_near_zone_width_m", "2.0"),
-        ("forward_cruise", "0.70"),
-        ("yaw_kp", "1.00"),
-        ("yaw_ki", "0.15"),
-        ("yaw_kd", "0.08"),
-        ("yaw_integral_limit", "2.0"),
-        ("yaw_limit", "0.72"),
-        ("move_heading_tolerance_rad", "0.1745"),
-        ("vision_heading_tolerance_rad", "0.12"),
     ]
     homing_int_names = [
         ("homing_gradient_window_size", "12"),
@@ -107,9 +97,27 @@ def generate_launch_description():
         name: LaunchConfiguration(name)
         for name, _ in homing_float_names + homing_int_names
     }
+    line_search_float_names = [
+        ("snr_sample_spacing_m", "0.15"),
+        ("snr_drop_from_peak_db", "2.0"),
+        ("snr_timeout_s", "1.0"),
+        ("max_snr_odom_skew_s", "0.15"),
+        ("odometry_timeout_s", "0.5"),
+        ("rate_hz", "30.0"),
+    ]
+    line_search_int_names = [
+        ("line_search_direction", "1"),
+        ("snr_decline_count_limit", "5"),
+        ("snr_median_window_size", "3"),
+    ]
 
     arguments = [
         DeclareLaunchArgument("use_sim_time", default_value="false"),
+        DeclareLaunchArgument(
+            "controller_mode",
+            default_value="region",
+            description="region 또는 line_search. 두 제어기는 동시에 실행하지 않는다.",
+        ),
         DeclareLaunchArgument(
             "raw_odometry_topic", default_value="/odometry/filtered"
         ),
@@ -141,7 +149,7 @@ def generate_launch_description():
         DeclareLaunchArgument("attenuation_power", default_value="2.0"),
         DeclareLaunchArgument("sound_speed_mps", default_value="1500.0"),
         DeclareLaunchArgument("arena_start_corner", default_value="bottom_left"),
-        DeclareLaunchArgument("invert_rc_yaw", default_value="true"),
+        DeclareLaunchArgument("arena_frame_id", default_value="arena"),
         DeclareLaunchArgument("vision_handoff_enabled", default_value="true"),
         DeclareLaunchArgument(
             "vision_search_request_topic",
@@ -161,7 +169,6 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "homing_direction_topic", default_value="/homing/homing_direction"
         ),
-        DeclareLaunchArgument("rc_override_topic", default_value="/mavros/rc/override"),
         DeclareLaunchArgument(
             "emergency_stop_topic", default_value="/mission/emergency_stop"
         ),
@@ -175,7 +182,10 @@ def generate_launch_description():
     ]
     arguments += [
         DeclareLaunchArgument(name, default_value=default)
-        for name, default in homing_float_names + homing_int_names
+        for name, default in (
+            homing_float_names + homing_int_names +
+            line_search_float_names + line_search_int_names
+        )
     ]
 
     pinger_audio = Node(
@@ -234,11 +244,14 @@ def generate_launch_description():
         PythonLaunchDescriptionSource(
             package_share + "/launch/region_local_gradient_homing.launch.py"
         ),
+        condition=IfCondition(
+            PythonExpression(["'", controller_mode, "' == 'region'"])
+        ),
         launch_arguments={
             "use_sim_time": use_sim_time,
             "odometry_topic": homing_odometry_topic,
             "arena_start_corner": LaunchConfiguration("arena_start_corner"),
-            "invert_rc_yaw": LaunchConfiguration("invert_rc_yaw"),
+            "arena_frame_id": LaunchConfiguration("arena_frame_id"),
             "vision_handoff_enabled": LaunchConfiguration(
                 "vision_handoff_enabled"
             ),
@@ -257,13 +270,90 @@ def generate_launch_description():
             "homing_direction_topic": LaunchConfiguration(
                 "homing_direction_topic"
             ),
-            "rc_override_topic": LaunchConfiguration("rc_override_topic"),
             "emergency_stop_topic": LaunchConfiguration("emergency_stop_topic"),
             "enable_keyboard_emergency_stop": LaunchConfiguration(
                 "enable_keyboard_emergency_stop"
             ),
             "emergency_stop_key": LaunchConfiguration("emergency_stop_key"),
+            "rate_hz": LaunchConfiguration("rate_hz"),
             **homing_values,
+        }.items(),
+    )
+
+    line_search_detector = Node(
+        package="audio_capture",
+        executable="audio_frequency_detector",
+        name="audio_frequency_detector",
+        output="screen",
+        condition=IfCondition(
+            PythonExpression(["'", controller_mode, "' == 'line_search'"])
+        ),
+        parameters=[
+            {"use_sim_time": ParameterValue(use_sim_time, value_type=bool)}
+        ],
+    )
+
+    line_search = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            package_share + "/launch/near_zone_line_search_homing.launch.py"
+        ),
+        condition=IfCondition(
+            PythonExpression(["'", controller_mode, "' == 'line_search'"])
+        ),
+        launch_arguments={
+            "use_sim_time": use_sim_time,
+            "odometry_topic": homing_odometry_topic,
+            "arena_start_corner": LaunchConfiguration("arena_start_corner"),
+            "arena_frame_id": LaunchConfiguration("arena_frame_id"),
+            "arena_length_m": LaunchConfiguration("arena_length_m"),
+            "arena_width_m": LaunchConfiguration("arena_width_m"),
+            "arena_offset_x_m": LaunchConfiguration("arena_offset_x_m"),
+            "arena_offset_y_m": LaunchConfiguration("arena_offset_y_m"),
+            "arena_safety_margin_m": LaunchConfiguration(
+                "arena_safety_margin_m"
+            ),
+            "vision_near_zone_width_m": LaunchConfiguration(
+                "vision_near_zone_width_m"
+            ),
+            "target_depth_z_m": LaunchConfiguration("target_depth_z_m"),
+            "waypoint_reach_tolerance_m": LaunchConfiguration(
+                "waypoint_reach_tolerance_m"
+            ),
+            "snr_sample_spacing_m": LaunchConfiguration(
+                "snr_sample_spacing_m"
+            ),
+            "snr_drop_from_peak_db": LaunchConfiguration(
+                "snr_drop_from_peak_db"
+            ),
+            "snr_timeout_s": LaunchConfiguration("snr_timeout_s"),
+            "max_snr_odom_skew_s": LaunchConfiguration(
+                "max_snr_odom_skew_s"
+            ),
+            "odometry_timeout_s": LaunchConfiguration("odometry_timeout_s"),
+            "rate_hz": LaunchConfiguration("rate_hz"),
+            "line_search_direction": LaunchConfiguration(
+                "line_search_direction"
+            ),
+            "snr_decline_count_limit": LaunchConfiguration(
+                "snr_decline_count_limit"
+            ),
+            "snr_median_window_size": LaunchConfiguration(
+                "snr_median_window_size"
+            ),
+            "vision_search_request_topic": LaunchConfiguration(
+                "vision_search_request_topic"
+            ),
+            "target_confirmed_topic": LaunchConfiguration(
+                "target_confirmed_topic"
+            ),
+            "vision_control_granted_topic": LaunchConfiguration(
+                "vision_control_granted_topic"
+            ),
+            "emergency_stop_topic": LaunchConfiguration("emergency_stop_topic"),
+            "enable_keyboard_emergency_stop": LaunchConfiguration(
+                "enable_keyboard_emergency_stop"
+            ),
+            "emergency_stop_key": LaunchConfiguration("emergency_stop_key"),
         }.items(),
     )
 
@@ -284,6 +374,7 @@ def generate_launch_description():
                 "vision_near_zone_width_m"
             ),
             "arena_start_corner": LaunchConfiguration("arena_start_corner"),
+            "arena_frame_id": LaunchConfiguration("arena_frame_id"),
             "map_cell_size_m": LaunchConfiguration(
                 "region_sample_spacing_m"
             ),
@@ -297,5 +388,12 @@ def generate_launch_description():
     )
 
     return LaunchDescription(
-        arguments + [pinger_audio, odometry_rebaser, homing, rviz]
+        arguments + [
+            pinger_audio,
+            odometry_rebaser,
+            homing,
+            line_search_detector,
+            line_search,
+            rviz,
+        ]
     )

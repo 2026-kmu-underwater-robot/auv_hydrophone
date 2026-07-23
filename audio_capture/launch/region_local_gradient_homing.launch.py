@@ -19,8 +19,7 @@ from launch_ros.parameter_descriptions import ParameterValue
 #   rescan_radius_m:=0.50 \
 #   homing_waypoint_step_m:=0.50 \
 #   homing_zigzag_offset_m:=0.15 \
-#   vision_near_zone_width_m:=0.60 \
-#   forward_cruise:=0.25
+#   vision_near_zone_width_m:=0.60
 
 
 def generate_launch_description():
@@ -32,7 +31,6 @@ def generate_launch_description():
     scan_center_topic = LaunchConfiguration("scan_center_topic")  # 스캔 중심
     region_gradient_topic = LaunchConfiguration("region_gradient_topic")  # 스캔 그래디언트
     rolling_gradient_topic = LaunchConfiguration("rolling_gradient_topic")  # 롤링 그래디언트
-    rc_override_topic = LaunchConfiguration("rc_override_topic")  # RC override 출력
 
     float_names = [
         ("arena_length_m", "15.0"),  # 수조 길이
@@ -47,10 +45,7 @@ def generate_launch_description():
         ("rolling_gradient_alpha", "0.15"),  # 롤링 그래디언트 방향 스무딩 비율
         ("rolling_gradient_conflict_angle_rad", "1.0472"),  # 방향 충돌 판정 각도 (60도)
         ("waypoint_reach_tolerance_m", "0.15"),  # waypoint 도착 판정 반경
-        ("scan_radial_kp", "1.5"),  # 원형스캔 반경 오차 P 게인
-        ("scan_radial_ki", "0.05"),  # 원형스캔 반경 오차 I 게인
-        ("scan_radial_kd", "0.3"),  # 원형스캔 반경 오차 D 게인
-        ("scan_radial_integral_limit", "1.0"),  # 반경 오차 적분 제한
+        ("scan_waypoint_lookahead_rad", "0.35"),  # 현재 각도보다 앞선 원주 목표각
         ("region_sample_spacing_m", "0.15"),  # SNR 샘플 최소 간격
         ("min_region_gradient_magnitude", "0.05"),  # 유효 그래디언트 최소 크기
         ("min_region_lateral_spread_m", "0.10"),  # 유효 피팅용 최소 횡방향 퍼짐
@@ -58,15 +53,6 @@ def generate_launch_description():
         ("target_depth_z_m", "-0.65"),  # 목표 수심 (odom z)
         ("odometry_timeout_s", "0.5"),  # odometry 신선도 타임아웃
         ("max_snr_odom_skew_s", "0.15"),  # SNR-odometry 시각 허용 오차
-        ("forward_cruise", "0.5"),  # 정렬 후 전진 RC 명령 크기
-        ("yaw_kp", "1.15"),  # yaw 오차 비례 게인
-        ("yaw_ki", "0.15"),  # 지속 yaw 오차 제거용 적분 게인
-        ("yaw_kd", "0.08"),  # yaw 오차 변화 감쇠 게인
-        ("yaw_integral_limit", "2.0"),  # yaw 적분 누적 제한 (rad*s)
-        ("yaw_limit", "0.72"),  # yaw 명령 최대 크기
-        ("move_heading_tolerance_rad", "0.1745"),  # 전진 허용 헤딩 오차
-        ("vision_heading_tolerance_rad", "0.12"),  # Vision 확인 중 전진 허용 헤딩 오차
-        ("rc_pwm_span", "400.0"),  # RC 중립±PWM 스팬
         ("rate_hz", "30.0"),  # 제어 루프 주기
     ]
     int_names = [
@@ -88,8 +74,9 @@ def generate_launch_description():
             "state_topic", default_value="/homing/control_state"
         ),  # 제어 상태 토픽
         DeclareLaunchArgument(
-            "waypoint_topic", default_value="/homing/current_waypoint"
+            "waypoint_topic", default_value="/waypoint"
         ),  # 현재 목표 waypoint 토픽
+        DeclareLaunchArgument("arena_frame_id", default_value="arena"),
         DeclareLaunchArgument(
             "scan_center_topic", default_value="/homing/scan_center"
         ),  # 원형 스캔 중심 토픽
@@ -115,9 +102,6 @@ def generate_launch_description():
             "homing_direction_topic", default_value="/homing/homing_direction"
         ),  # 실제 호밍 진행 방향 토픽
         DeclareLaunchArgument(
-            "rc_override_topic", default_value="/mavros/rc/override"
-        ),  # MAVROS RC override 출력 토픽
-        DeclareLaunchArgument(
             "emergency_stop_topic", default_value="/mission/emergency_stop"
         ),
         DeclareLaunchArgument("enable_keyboard_emergency_stop", default_value="true"),
@@ -130,9 +114,6 @@ def generate_launch_description():
                 "initial heading is always arena +X."
             ),
         ),  # 수조 시작 코너 (안쪽 Y 부호 결정)
-        DeclareLaunchArgument(
-            "invert_rc_yaw", default_value="true"
-        ),  # RC yaw 채널 부호 반전
         DeclareLaunchArgument(
             "vision_handoff_enabled", default_value="true"
         ),  # 근접 구간에서 비전 인계 사용 여부
@@ -186,16 +167,13 @@ def generate_launch_description():
             "vision_control_granted_topic"
         ),
         "homing_direction_topic": LaunchConfiguration("homing_direction_topic"),
-        "rc_override_topic": rc_override_topic,
+        "arena_frame_id": LaunchConfiguration("arena_frame_id"),
         "emergency_stop_topic": LaunchConfiguration("emergency_stop_topic"),
         "enable_keyboard_emergency_stop": ParameterValue(
             LaunchConfiguration("enable_keyboard_emergency_stop"), value_type=bool
         ),
         "emergency_stop_key": LaunchConfiguration("emergency_stop_key"),
         "arena_start_corner": LaunchConfiguration("arena_start_corner"),
-        "invert_rc_yaw": ParameterValue(
-            LaunchConfiguration("invert_rc_yaw"), value_type=bool
-        ),
         "vision_handoff_enabled": ParameterValue(
             LaunchConfiguration("vision_handoff_enabled"), value_type=bool
         ),
@@ -213,22 +191,10 @@ def generate_launch_description():
         "rolling_gradient_alpha",
         "rolling_gradient_conflict_angle_rad",
         "waypoint_reach_tolerance_m",
-        "scan_radial_kp",
-        "scan_radial_ki",
-        "scan_radial_kd",
-        "scan_radial_integral_limit",
+        "scan_waypoint_lookahead_rad",
         "vision_near_zone_width_m",
         "target_depth_z_m",
         "odometry_timeout_s",
-        "forward_cruise",
-        "yaw_kp",
-        "yaw_ki",
-        "yaw_kd",
-        "yaw_integral_limit",
-        "yaw_limit",
-        "move_heading_tolerance_rad",
-        "vision_heading_tolerance_rad",
-        "rc_pwm_span",
         "rate_hz",
     ]:
         controller_parameters[name] = ParameterValue(values[name], value_type=float)

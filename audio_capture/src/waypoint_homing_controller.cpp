@@ -18,7 +18,6 @@
 #include <Eigen/Dense>
 #include <geometry_msgs/msg/point_stamped.hpp>
 #include <geometry_msgs/msg/vector3_stamped.hpp>
-#include <mavros_msgs/msg/override_rc_in.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_components/register_node_macro.hpp>
@@ -27,8 +26,7 @@
 
 namespace audio_capture
 {
-// 초기 pose를 arena (0,0,+X)로 고정하고 모든 scan/homing 이동을 절대 odometry
-// waypoint로 수행하고 odometry z로 목표 depth를 동시에 유지한다.
+// odometry에서 경로를 생성하고 arena 좌표 waypoint로 변환해 외부 추종기에 전달한다.
 class WaypointHomingControllerNode : public rclcpp::Node
 {
 public:
@@ -47,18 +45,18 @@ public:
         const auto state_topic = declare_parameter<std::string>(
             "state_topic", "/homing/control_state");
         const auto waypoint_topic = declare_parameter<std::string>(
-            "waypoint_topic", "/homing/current_waypoint");
+            "waypoint_topic", "/waypoint");
+        arena_frame_id_ = declare_parameter<std::string>(
+            "arena_frame_id", "arena");
         const auto scan_center_topic = declare_parameter<std::string>(
             "scan_center_topic", "/homing/scan_center");
         const auto vision_search_request_topic = declare_parameter<std::string>(
             "vision_search_request_topic", "/homing/vision_search_active");
         const auto target_confirmed_topic = declare_parameter<std::string>(
             "target_confirmed_topic", "/vision/target_confirmed");
-        // [ACOUSTIC-VISION HANDSHAKE] Vision은 이 승인 후에만 RC를 발행한다.
+        // [ACOUSTIC-VISION HANDSHAKE] Vision은 이 승인 후에만 제어를 시작한다.
         const auto vision_control_granted_topic = declare_parameter<std::string>(
             "vision_control_granted_topic", "/homing/vision_control_granted");
-        const auto rc_override_topic = declare_parameter<std::string>(
-            "rc_override_topic", "/mavros/rc/override");
         const auto emergency_stop_topic = declare_parameter<std::string>(
             "emergency_stop_topic", "/mission/emergency_stop");
         const bool enable_keyboard_emergency_stop = declare_parameter<bool>(
@@ -114,15 +112,9 @@ public:
                     "rolling_gradient_conflict_limit", 3)));
         waypoint_reach_tolerance_m_ = std::max(
             0.01, declare_parameter<double>("waypoint_reach_tolerance_m", 0.15));
-        scan_radial_kp_ = std::max(
-            0.0, declare_parameter<double>("scan_radial_kp", 1.5));
-        scan_radial_ki_ = std::max(
-            0.0, declare_parameter<double>("scan_radial_ki", 0.05));
-        scan_radial_kd_ = std::max(
-            0.0, declare_parameter<double>("scan_radial_kd", 0.3));
-        scan_radial_integral_limit_ = std::max(
-            0.0, declare_parameter<double>(
-                "scan_radial_integral_limit", 1.0));
+        scan_waypoint_lookahead_rad_ = std::clamp(
+            declare_parameter<double>("scan_waypoint_lookahead_rad", 0.35),
+            0.01, PI / 2.0);
         vision_near_zone_width_m_ = std::clamp(
             declare_parameter<double>("vision_near_zone_width_m", 2.0),
             0.0, arena_width_m_);
@@ -137,25 +129,6 @@ public:
             declare_parameter<double>("rate_hz", 30.0), 1.0, 120.0);
         odometry_timeout_s_ = std::max(
             0.05, declare_parameter<double>("odometry_timeout_s", 0.5));
-        forward_cruise_ = std::clamp(
-            declare_parameter<double>("forward_cruise", 0.5), 0.0, 1.0);
-        yaw_kp_ = std::max(
-            0.0, declare_parameter<double>("yaw_kp", 1.15));
-        yaw_ki_ = std::max(
-            0.0, declare_parameter<double>("yaw_ki", 0.15));
-        yaw_kd_ = std::max(
-            0.0, declare_parameter<double>("yaw_kd", 0.08));
-        yaw_integral_limit_ = std::max(
-            0.0, declare_parameter<double>("yaw_integral_limit", 2.0));
-        yaw_limit_ = std::clamp(
-            declare_parameter<double>("yaw_limit", 0.72), 0.0, 1.0);
-        move_heading_tolerance_rad_ = std::clamp(
-            declare_parameter<double>("move_heading_tolerance_rad", 0.1745), 0.01, PI);
-        vision_heading_tolerance_rad_ = std::clamp(
-            declare_parameter<double>("vision_heading_tolerance_rad", 0.12), 0.01, PI);
-        rc_pwm_span_ = std::clamp(
-            declare_parameter<double>("rc_pwm_span", 400.0), 50.0, 700.0);
-        invert_rc_yaw_ = declare_parameter<bool>("invert_rc_yaw", true);
 
         odometry_sub_ = create_subscription<nav_msgs::msg::Odometry>(
             odometry_topic, 30,
@@ -191,8 +164,6 @@ public:
             create_publisher<geometry_msgs::msg::Vector3Stamped>(
                 homing_direction_topic,
                 rclcpp::QoS(1).reliable().transient_local());
-        rc_pub_ = create_publisher<mavros_msgs::msg::OverrideRCIn>(
-            rc_override_topic, 10);
         emergency_stop_pub_ = create_publisher<std_msgs::msg::Bool>(
             emergency_stop_topic, rclcpp::QoS(1).reliable().transient_local());
         emergency_stop_sub_ = create_subscription<std_msgs::msg::Bool>(
@@ -213,7 +184,7 @@ public:
                 &WaypointHomingControllerNode::keyboard_loop, this);
             RCLCPP_INFO(
                 get_logger(),
-                "Emergency neutral enabled. Press '%c' to latch neutral RC.",
+                "Emergency hold enabled. Press '%c' to latch the current waypoint.",
                 emergency_stop_key_.front());
         }
 
@@ -234,19 +205,7 @@ public:
 
 private:
     static constexpr double PI = 3.14159265358979323846;
-    static constexpr std::uint16_t RC_NEUTRAL = 1500;
-    static constexpr std::size_t VERTICAL_CHANNEL_INDEX = 2;
-    static constexpr std::size_t YAW_CHANNEL_INDEX = 3;
-    static constexpr std::size_t FORWARD_CHANNEL_INDEX = 4;
-    static constexpr std::size_t LATERAL_CHANNEL_INDEX = 5;
-    static constexpr double DEPTH_PROPORTIONAL_GAIN = 0.8;
-    static constexpr double DEPTH_INTEGRAL_GAIN = 0.15;
-    static constexpr double HEAVE_LIMIT = 0.2;
     static constexpr double DEPTH_TOLERANCE_M = 0.05;
-    static constexpr double REALIGN_HEADING_ERROR_RAD = PI / 3.0;
-    static constexpr double YAW_DERIVATIVE_ALPHA = 0.2;
-    static constexpr double SCAN_RADIAL_DERIVATIVE_ALPHA = 0.2;
-    static constexpr double SCAN_RADIAL_CORRECTION_LIMIT = 1.0;
 
     enum class State
     {
@@ -255,8 +214,7 @@ private:
         REGION_SCAN,    //원형 탐색 상태
         REGION_HOMING,    //원형 탐색 결과 그래디언트 매칭 상태
         WAIT_VISION_TARGET,    // [ACOUSTIC-VISION HANDSHAKE] 경계에서 Vision 확정을 기다린다.
-        HANDOFF_NEUTRAL,       // [ACOUSTIC-VISION HANDSHAKE] 중립 RC를 딱 한 번 보낸다.
-        HANDOFF_COMPLETE       // [ACOUSTIC-VISION HANDSHAKE] Acoustic RC를 영구 종료한다.
+        HANDOFF_COMPLETE       // [ACOUSTIC-VISION HANDSHAKE] Acoustic waypoint 생성을 종료한다.
     };
 
     enum class HomingWaypointResult
@@ -281,31 +239,18 @@ private:
         double y_max = 0.0;
     };
 
-    struct Command
-    {
-        double forward = 0.0;
-        double yaw = 0.0;
-        double heave = 0.0;
-    };
-
     void odometry_callback(const nav_msgs::msg::Odometry::ConstSharedPtr msg)
     {
         // 현재 위치와 yaw를 업데이트한다.
         const Eigen::Vector2d position(
             msg->pose.pose.position.x, msg->pose.pose.position.y);
         const double z_m = msg->pose.pose.position.z;
-        const double yaw = yaw_from_quaternion(
-            msg->pose.pose.orientation.w,
-            msg->pose.pose.orientation.x,
-            msg->pose.pose.orientation.y,
-            msg->pose.pose.orientation.z);
-        if (!position.allFinite() || !std::isfinite(z_m) || !std::isfinite(yaw)) { // 위치와 yaw가 유효하지 않으면 무시한다.
+        if (!position.allFinite() || !std::isfinite(z_m)) {
             return;
         }
         const bool first_odometry = !have_odometry_;
         current_position_ = position; // 현재 위치를 업데이트한다.
         current_z_m_ = z_m;
-        current_yaw_rad_ = yaw; // 현재 yaw를 업데이트한다.
         odometry_frame_ = msg->header.frame_id.empty() ? "odom" : msg->header.frame_id; // 오돔 메세지가 어느 좌표계 기준인지 업데이트한다 (빈 문자열이면 odom 기준).
         last_odometry_receive_time_ = now(); // 마지막 오도메트리 수신 시간을 업데이트한다.
         have_odometry_ = true; // 오도메트리 수신 여부를 업데이트한다.
@@ -393,10 +338,12 @@ private:
         {
             return;
         }
-        // [ACOUSTIC-VISION HANDSHAKE RESTORED] Vision 확정 뒤에만 중립·grant를 시작한다.
-        handoff_neutral_sent_ = false;
-        transition_to(State::HANDOFF_NEUTRAL);
-        RCLCPP_INFO(get_logger(), "[VISION] target confirmed; neutral handoff started");
+        set_current_waypoint(current_position_);
+        transition_to(State::HANDOFF_COMPLETE);
+        publish_vision_control_granted(true);
+        RCLCPP_INFO(
+            get_logger(),
+            "[VISION] target confirmed; hold waypoint sent and vision control granted");
     }
 
     bool inside_vision_zone(const Eigen::Vector2d & position) const
@@ -451,8 +398,7 @@ private:
     void begin_vision_wait()
     {
         request_vision_confirmation();
-        reset_yaw_pid();
-        publish_rc(Command{});
+        set_current_waypoint(current_position_);
         transition_to(State::WAIT_VISION_TARGET);
         RCLCPP_INFO(
             get_logger(),
@@ -462,40 +408,21 @@ private:
     void control_loop()
     {
         const rclcpp::Time current_time = now(); // 현재 시간을 가져온다.
-        // [EMERGENCY NEUTRAL] 인계 상태와 무관하게 제어 채널 중립을 계속 발행한다.
         if (emergency_stop_active_.load()) {
-            reset_yaw_pid();
-            publish_rc(Command{});
+            if (!emergency_hold_published_ && have_odometry_) {
+                set_current_waypoint(current_position_);
+                emergency_hold_published_ = true;
+            }
             RCLCPP_ERROR_THROTTLE(
                 get_logger(), *get_clock(), 2000,
-                "[EMERGENCY] neutral RC latched; restart required to resume");
-            return;
-        }
-        // [ACOUSTIC-VISION HANDSHAKE] 중립을 한 주기 먼저 보낸 다음 Vision에 RC 소유권을 승인한다.
-        if (state_ == State::HANDOFF_NEUTRAL) {
-            if (!handoff_neutral_sent_) {
-                publish_rc(Command{});
-                handoff_neutral_sent_ = true;
-                handoff_neutral_time_ = current_time;
-                return;
-            }
-            if ((current_time - handoff_neutral_time_).seconds() >= 1.0 / rate_hz_) {
-                transition_to(State::HANDOFF_COMPLETE);
-                publish_vision_control_granted(true);
-                RCLCPP_INFO(get_logger(), "[VISION] acoustic RC stopped; vision control granted");
-            }
+                "[EMERGENCY] current-position waypoint latched; restart required");
             return;
         }
         if (state_ == State::WAIT_VISION_TARGET || state_ == State::HANDOFF_COMPLETE) {
-            depth_control_time_initialized_ = false;
-            reset_yaw_pid();
             log_controller_status();
             return;
         }
         if (!odometry_is_fresh(current_time)) {
-            depth_control_time_initialized_ = false;
-            reset_yaw_pid();
-            publish_rc(Command{});
             return;
         }
         log_controller_status();
@@ -509,29 +436,27 @@ private:
 
         switch (state_) {
             case State::MOVE_TO_SCAN_CENTER:    //원형 탐색 중심 위치로 이동하기 위한 준비 상태
-                if (follow_waypoint(current_time) && depth_target_reached()) {
+                if (waypoint_reached() && depth_target_reached()) {
                     begin_move_to_scan_start();
                 }
                 return;
 
             case State::MOVE_TO_SCAN_START:
-                if (follow_waypoint(current_time)) {
+                if (waypoint_reached()) {
                     begin_region_scan();
                 }
                 return;
 
             case State::REGION_SCAN:
                 if (accumulated_scan_angle_rad_ < 2.0 * PI &&
-                    !follow_circular_scan(current_time))
+                    !update_circular_scan_waypoint())
                 {
                     return;
                 }
                 if (region_result_state_ == RegionResultState::WAITING) {
-                    publish_rc(depth_hold_command(current_time));
                     return;
                 }
                 if (region_result_state_ == RegionResultState::INVALID) {
-                    publish_rc(depth_hold_command(current_time));
                     RCLCPP_WARN(
                         get_logger(), "[RESCAN] reason=invalid_region_gradient");
                     start_new_region_scan(current_position_); // 현재 위치 기준으로 새로운 원형 탐색을 요청.
@@ -545,14 +470,13 @@ private:
                     start_new_region_scan(current_position_);
                     return;
                 }
-                if (!follow_waypoint(current_time)) {
+                if (!waypoint_reached()) {
                     return;
                 }
                 handle_homing_waypoint_result(make_next_homing_waypoint());
                 return;
 
             case State::WAIT_VISION_TARGET:
-            case State::HANDOFF_NEUTRAL:
             case State::HANDOFF_COMPLETE:
                 return;
         }
@@ -593,12 +517,7 @@ private:
         const Eigen::Vector2d radial = current_position_ - scan_center_;
         previous_scan_angle_rad_ = std::atan2(radial.y(), radial.x());
         accumulated_scan_angle_rad_ = 0.0;
-        scan_radial_error_integral_ = 0.0;
-        scan_radial_error_derivative_ = 0.0;
-        scan_radial_pid_initialized_ = false;
         region_result_state_ = RegionResultState::WAITING;
-        waypoint_heading_aligned_ = false;
-        reset_yaw_pid();
         transition_to(State::REGION_SCAN);
         RCLCPP_INFO(
             get_logger(),
@@ -674,48 +593,21 @@ private:
             begin_vision_wait();
             return;
         }
-        publish_rc(depth_hold_command(now()));
         RCLCPP_WARN(get_logger(), "[RESCAN] reason=arena_boundary");
         start_new_region_scan(current_position_);
     }
 
-    bool follow_waypoint(const rclcpp::Time & current_time)
+    bool waypoint_reached() const
     {
-        const Eigen::Vector2d delta = current_waypoint_ - current_position_; // 현재 위치와 waypoint 사이의 벡터
-        const double distance = delta.norm(); // 현재 위치와 waypoint 사이의 거리
-        if (distance <= waypoint_reach_tolerance_m_) {
-            publish_rc(depth_hold_command(current_time));
-            return true;
-        }
-        const double desired_yaw = std::atan2(delta.y(), delta.x()); // 현재 위치와 waypoint 사이의 벡터를 이용하여 원하는 yaw 값을 계산한다.
-        const double yaw_error = wrap_pi(desired_yaw - current_yaw_rad_); // 현재 yaw와 원하는 yaw 사이의 오차.
-        Command command = depth_hold_command(current_time); // 수평 이동과 목표 depth 제어를 동시에 수행한다.
-        command.yaw = yaw_pid_command(yaw_error, current_time);
-        const double heading_tolerance = vision_search_requested_ ?
-            vision_heading_tolerance_rad_ : move_heading_tolerance_rad_;
-        if (!waypoint_heading_aligned_ &&
-            std::abs(yaw_error) <= heading_tolerance)
-        {
-            waypoint_heading_aligned_ = true;
-        }
-        if (waypoint_heading_aligned_ &&
-            std::abs(yaw_error) >= REALIGN_HEADING_ERROR_RAD)
-        {
-            waypoint_heading_aligned_ = false;
-        }
-        if (waypoint_heading_aligned_) {
-            command.forward = forward_cruise_;
-        }
-        publish_rc(command); // 명령을 보낸다.
-        return false; // 아직 도착하지 않았으므로 false를 반환.
+        return (current_waypoint_ - current_position_).norm() <=
+            waypoint_reach_tolerance_m_;
     }
 
-    bool follow_circular_scan(const rclcpp::Time & current_time)
+    bool update_circular_scan_waypoint()
     {
         const Eigen::Vector2d radial = current_position_ - scan_center_;
         const double radius = radial.norm();
         if (radius <= 1.0e-6) {
-            publish_rc(depth_hold_command(current_time));
             return false;
         }
 
@@ -726,156 +618,17 @@ private:
         }
         previous_scan_angle_rad_ = angle;
         if (accumulated_scan_angle_rad_ >= 2.0 * PI) {
+            set_current_waypoint(current_position_);
             RCLCPP_INFO(
                 get_logger(), "[SCAN] continuous circle complete");
             return true;
         }
 
-        const Eigen::Vector2d radial_unit = radial / radius;
-        const Eigen::Vector2d tangent(-radial_unit.y(), radial_unit.x());
-        const double radial_error = radius - active_scan_radius_m_;
-        double dt = 0.0;
-        if (scan_radial_pid_initialized_) {
-            dt = std::clamp(
-                (current_time - last_scan_radial_control_time_).seconds(),
-                0.0, 0.2);
-        }
-        last_scan_radial_control_time_ = current_time;
-
-        if (scan_radial_pid_initialized_ && dt > 1.0e-6) {
-            const double raw_derivative =
-                (radial_error - previous_scan_radial_error_) / dt;
-            scan_radial_error_derivative_ =
-                (1.0 - SCAN_RADIAL_DERIVATIVE_ALPHA) *
-                scan_radial_error_derivative_ +
-                SCAN_RADIAL_DERIVATIVE_ALPHA * raw_derivative;
-        }
-        previous_scan_radial_error_ = radial_error;
-        scan_radial_pid_initialized_ = true;
-
-        const double candidate_integral = std::clamp(
-            scan_radial_error_integral_ + radial_error * dt,
-            -scan_radial_integral_limit_,
-            scan_radial_integral_limit_);
-        const double candidate_correction =
-            scan_radial_kp_ * radial_error +
-            scan_radial_ki_ * candidate_integral +
-            scan_radial_kd_ * scan_radial_error_derivative_;
-        if (std::abs(candidate_correction) <= SCAN_RADIAL_CORRECTION_LIMIT ||
-            candidate_correction * radial_error < 0.0)
-        {
-            scan_radial_error_integral_ = candidate_integral;
-        }
-        const double radial_correction = std::clamp(
-            scan_radial_kp_ * radial_error +
-            scan_radial_ki_ * scan_radial_error_integral_ +
-            scan_radial_kd_ * scan_radial_error_derivative_,
-            -SCAN_RADIAL_CORRECTION_LIMIT,
-            SCAN_RADIAL_CORRECTION_LIMIT);
-        const Eigen::Vector2d guidance =
-            tangent - radial_correction * radial_unit;
-        const double desired_yaw = std::atan2(guidance.y(), guidance.x());
-        const double yaw_error = wrap_pi(desired_yaw - current_yaw_rad_);
-
-        Command command = depth_hold_command(current_time);
-        command.yaw = yaw_pid_command(yaw_error, current_time);
-        if (!waypoint_heading_aligned_ &&
-            std::abs(yaw_error) <= move_heading_tolerance_rad_)
-        {
-            waypoint_heading_aligned_ = true;
-        }
-        if (waypoint_heading_aligned_ &&
-            std::abs(yaw_error) >= REALIGN_HEADING_ERROR_RAD)
-        {
-            waypoint_heading_aligned_ = false;
-        }
-        if (waypoint_heading_aligned_) {
-            command.forward = forward_cruise_;
-        }
-        publish_rc(command);
+        const double target_angle = angle + scan_waypoint_lookahead_rad_;
+        set_current_waypoint(
+            scan_center_ + active_scan_radius_m_ *
+            Eigen::Vector2d(std::cos(target_angle), std::sin(target_angle)));
         return false;
-    }
-
-    double yaw_pid_command(
-        const double yaw_error, const rclcpp::Time & current_time)
-    {
-        double dt = 0.0;
-        if (yaw_pid_initialized_) {
-            dt = std::clamp(
-                (current_time - last_yaw_control_time_).seconds(), 0.0, 0.2);
-        }
-        last_yaw_control_time_ = current_time;
-
-        if (yaw_pid_initialized_ && dt > 1.0e-6) {
-            const double raw_derivative =
-                wrap_pi(yaw_error - previous_yaw_error_) / dt;
-            yaw_error_derivative_ =
-                (1.0 - YAW_DERIVATIVE_ALPHA) * yaw_error_derivative_ +
-                YAW_DERIVATIVE_ALPHA * raw_derivative;
-        }
-        previous_yaw_error_ = yaw_error;
-        yaw_pid_initialized_ = true;
-
-        const double candidate_integral = std::clamp(
-            yaw_error_integral_ + yaw_error * dt,
-            -yaw_integral_limit_, yaw_integral_limit_);
-        const double candidate_command =
-            yaw_kp_ * yaw_error +
-            yaw_ki_ * candidate_integral +
-            yaw_kd_ * yaw_error_derivative_;
-        if (std::abs(candidate_command) <= yaw_limit_ ||
-            candidate_command * yaw_error < 0.0)
-        {
-            yaw_error_integral_ = candidate_integral;
-        }
-
-        last_yaw_error_ = yaw_error;
-        last_yaw_command_ = std::clamp(
-            yaw_kp_ * yaw_error +
-            yaw_ki_ * yaw_error_integral_ +
-            yaw_kd_ * yaw_error_derivative_,
-            -yaw_limit_, yaw_limit_);
-        return last_yaw_command_;
-    }
-
-    void reset_yaw_pid()
-    {
-        yaw_pid_initialized_ = false;
-        previous_yaw_error_ = 0.0;
-        yaw_error_integral_ = 0.0;
-        yaw_error_derivative_ = 0.0;
-        last_yaw_error_ = 0.0;
-        last_yaw_command_ = 0.0;
-    }
-
-    Command depth_hold_command(const rclcpp::Time & current_time)
-    {
-        Command command;
-        const double error = target_depth_z_m_ - current_z_m_;
-
-        double dt = 0.0;
-        if (depth_control_time_initialized_) {
-            dt = std::clamp(
-                (current_time - last_depth_control_time_).seconds(), 0.0, 0.2);
-        }
-        last_depth_control_time_ = current_time;
-        depth_control_time_initialized_ = true;
-
-        const double candidate_integral = depth_error_integral_ + error * dt;
-        const double candidate_heave = -(
-            DEPTH_PROPORTIONAL_GAIN * error +
-            DEPTH_INTEGRAL_GAIN * candidate_integral);
-        if (std::abs(candidate_heave) <= HEAVE_LIMIT ||
-            (candidate_heave > HEAVE_LIMIT && error > 0.0) ||
-            (candidate_heave < -HEAVE_LIMIT && error < 0.0))
-        {
-            depth_error_integral_ = candidate_integral;
-        }
-        command.heave = std::clamp(
-            -(DEPTH_PROPORTIONAL_GAIN * error +
-                DEPTH_INTEGRAL_GAIN * depth_error_integral_),
-            -HEAVE_LIMIT, HEAVE_LIMIT);
-        return command;
     }
 
     bool depth_target_reached() const
@@ -886,7 +639,6 @@ private:
     void log_controller_status()
     {
         if (state_ == State::WAIT_VISION_TARGET ||
-            state_ == State::HANDOFF_NEUTRAL ||
             state_ == State::HANDOFF_COMPLETE)
         {
             RCLCPP_INFO_THROTTLE(
@@ -900,22 +652,18 @@ private:
             RCLCPP_INFO_THROTTLE(
                 get_logger(), *get_clock(), 2000,
                 "[CONTROL] state=REGION_SCAN progress=%.0f/360 deg "
-                "radius=%.2f/%.2f m yaw_error=%.1f deg yaw_cmd=%.2f "
-                "z=%.2f/%.2f m",
+                "radius=%.2f/%.2f m z=%.2f/%.2f m",
                 std::clamp(
                     accumulated_scan_angle_rad_ * 180.0 / PI, 0.0, 360.0),
                 radius, active_scan_radius_m_,
-                last_yaw_error_ * 180.0 / PI, last_yaw_command_,
                 current_z_m_, target_depth_z_m_);
             return;
         }
         const double distance = (current_waypoint_ - current_position_).norm();
         RCLCPP_INFO_THROTTLE(
             get_logger(), *get_clock(), 2000,
-            "[CONTROL] state=%s distance=%.2f m "
-            "yaw_error=%.1f deg yaw_cmd=%.2f z=%.2f/%.2f m",
+            "[CONTROL] state=%s distance=%.2f m z=%.2f/%.2f m",
             state_name(state_), distance,
-            last_yaw_error_ * 180.0 / PI, last_yaw_command_,
             current_z_m_, target_depth_z_m_);
     }
 
@@ -965,13 +713,12 @@ private:
     void set_current_waypoint(const Eigen::Vector2d & waypoint)
     {
         current_waypoint_ = waypoint;
-        waypoint_heading_aligned_ = false;
-        reset_yaw_pid();
         geometry_msgs::msg::PointStamped msg;
         msg.header.stamp = now();
-        msg.header.frame_id = odometry_frame_;
-        msg.point.x = waypoint.x();
-        msg.point.y = waypoint.y();
+        msg.header.frame_id = arena_frame_id_;
+        msg.point.x = waypoint.x() - arena_offset_x_m_;
+        msg.point.y = waypoint.y() - arena_offset_y_m_;
+        msg.point.z = target_depth_z_m_;
         waypoint_pub_->publish(msg);
     }
 
@@ -1012,7 +759,7 @@ private:
         vision_search_request_pub_->publish(msg);
     }
 
-    // [ACOUSTIC-VISION HANDSHAKE] Vision RC 발행을 허용하는 최종 승인이다.
+    // [ACOUSTIC-VISION HANDSHAKE] Vision 제어를 허용하는 최종 승인이다.
     void publish_vision_control_granted(const bool granted)
     {
         std_msgs::msg::Bool msg;
@@ -1028,18 +775,6 @@ private:
         msg.vector.x = homing_direction_.x();
         msg.vector.y = homing_direction_.y();
         homing_direction_pub_->publish(msg);
-    }
-
-    void publish_rc(const Command & command)
-    {
-        mavros_msgs::msg::OverrideRCIn msg;
-        msg.channels.fill(mavros_msgs::msg::OverrideRCIn::CHAN_NOCHANGE);
-        // [RC OWNERSHIP] 이 제어기가 실제 사용하는 축만 override한다.
-        msg.channels[VERTICAL_CHANNEL_INDEX] = axis_pwm(command.heave, true);
-        msg.channels[YAW_CHANNEL_INDEX] = axis_pwm(command.yaw, invert_rc_yaw_);
-        msg.channels[FORWARD_CHANNEL_INDEX] = axis_pwm(command.forward, false);
-        msg.channels[LATERAL_CHANNEL_INDEX] = RC_NEUTRAL;
-        rc_pub_->publish(msg);
     }
 
     void emergency_stop_callback(const std_msgs::msg::Bool::ConstSharedPtr msg)
@@ -1058,7 +793,7 @@ private:
         msg.data = true;
         emergency_stop_pub_->publish(msg);
         RCLCPP_ERROR(
-            get_logger(), "[EMERGENCY] key '%c' pressed; neutral RC latched",
+            get_logger(), "[EMERGENCY] key '%c' pressed; hold waypoint requested",
             emergency_stop_key_.front());
     }
 
@@ -1107,15 +842,6 @@ private:
         close(terminal_fd);
     }
 
-    std::uint16_t axis_pwm(const double value, const bool invert) const
-    {
-        const double axis = invert ? -value : value;
-        const int pwm = static_cast<int>(std::llround(
-            static_cast<double>(RC_NEUTRAL) +
-            std::clamp(axis, -1.0, 1.0) * rc_pwm_span_));
-        return static_cast<std::uint16_t>(std::clamp(pwm, 1100, 1900));
-    }
-
     bool odometry_is_fresh(const rclcpp::Time & current_time) const
     {
         return have_odometry_ &&
@@ -1125,14 +851,6 @@ private:
     static double wrap_pi(const double angle)
     {
         return std::atan2(std::sin(angle), std::cos(angle));
-    }
-
-    static double yaw_from_quaternion(
-        const double w, const double x, const double y, const double z)
-    {
-        return std::atan2(
-            2.0 * (w * z + x * y),
-            1.0 - 2.0 * (y * y + z * z));
     }
 
     static const char * state_name(const State state)
@@ -1148,8 +866,6 @@ private:
                 return "REGION_HOMING";
             case State::WAIT_VISION_TARGET:
                 return "WAIT_VISION_TARGET";
-            case State::HANDOFF_NEUTRAL:
-                return "HANDOFF_NEUTRAL";
             case State::HANDOFF_COMPLETE:
                 return "HANDOFF_COMPLETE";
         }
@@ -1169,60 +885,30 @@ private:
     double rolling_gradient_alpha_ = 0.15;
     double rolling_gradient_conflict_angle_rad_ = PI / 3.0;
     double waypoint_reach_tolerance_m_ = 0.15;
-    double scan_radial_kp_ = 1.5;
-    double scan_radial_ki_ = 0.05;
-    double scan_radial_kd_ = 0.3;
-    double scan_radial_integral_limit_ = 1.0;
+    double scan_waypoint_lookahead_rad_ = 0.35;
     double vision_near_zone_width_m_ = 2.0;
     double target_depth_z_m_ = -0.65;
     double rate_hz_ = 30.0;
     double odometry_timeout_s_ = 0.5;
-    double forward_cruise_ = 0.5;
-    double yaw_kp_ = 1.15;
-    double yaw_ki_ = 0.15;
-    double yaw_kd_ = 0.08;
-    double yaw_integral_limit_ = 2.0;
-    double yaw_limit_ = 0.72;
-    double move_heading_tolerance_rad_ = 0.1745;
-    double vision_heading_tolerance_rad_ = 0.12;
-    double rc_pwm_span_ = 400.0;
     std::size_t rolling_gradient_conflict_limit_ = 3;
     std::size_t rolling_gradient_conflict_count_ = 0;
     double zigzag_sign_ = 1.0;
     std::string arena_start_corner_ = "bottom_left";
+    std::string arena_frame_id_ = "arena";
     std::string odometry_frame_ = "odom";
-    bool invert_rc_yaw_ = true;
     bool vision_handoff_enabled_ = true;
     bool have_odometry_ = false;
-    bool waypoint_heading_aligned_ = false;
     bool rescan_requested_ = false;
     bool vision_search_requested_ = false;
     bool first_region_scan_ = true;
-    bool depth_control_time_initialized_ = false;
-    bool yaw_pid_initialized_ = false;
-    bool scan_radial_pid_initialized_ = false;
-    bool handoff_neutral_sent_ = false;
+    bool emergency_hold_published_ = false;
     std::string emergency_stop_key_ = "s";
     State state_ = State::MOVE_TO_SCAN_CENTER;
     RegionResultState region_result_state_ = RegionResultState::WAITING;
     rclcpp::Time last_odometry_receive_time_;
-    rclcpp::Time last_depth_control_time_;
-    rclcpp::Time last_yaw_control_time_;
-    rclcpp::Time last_scan_radial_control_time_;
-    rclcpp::Time handoff_neutral_time_;
-    double current_yaw_rad_ = 0.0;
     double current_z_m_ = 0.0;
-    double depth_error_integral_ = 0.0;
-    double previous_yaw_error_ = 0.0;
-    double yaw_error_integral_ = 0.0;
-    double yaw_error_derivative_ = 0.0;
-    double last_yaw_error_ = 0.0;
-    double last_yaw_command_ = 0.0;
     double previous_scan_angle_rad_ = 0.0;
     double accumulated_scan_angle_rad_ = 0.0;
-    double previous_scan_radial_error_ = 0.0;
-    double scan_radial_error_integral_ = 0.0;
-    double scan_radial_error_derivative_ = 0.0;
     Eigen::Vector2d current_position_{0.0, 0.0};
     Eigen::Vector2d scan_center_{0.0, 0.0};
     Eigen::Vector2d current_waypoint_{0.0, 0.0};
@@ -1245,7 +931,6 @@ private:
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr vision_control_granted_pub_;
     rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr
         homing_direction_pub_;
-    rclcpp::Publisher<mavros_msgs::msg::OverrideRCIn>::SharedPtr rc_pub_;
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr emergency_stop_pub_;
     rclcpp::TimerBase::SharedPtr timer_;
     std::atomic_bool emergency_stop_active_{false};
