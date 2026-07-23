@@ -6,85 +6,122 @@ from launch_ros.descriptions import ComposableNode
 from launch_ros.parameter_descriptions import ParameterValue
 
 
+# 실험 수조버전 런치
+# ros2 launch audio_capture region_local_gradient_homing.launch.py \
+#   use_sim_time:=false \
+#   arena_start_corner:=bottom_left \
+#   arena_length_m:=5.49 \
+#   arena_width_m:=2.74 \
+#   arena_offset_x_m:=-0.30 \
+#   arena_offset_y_m:=0.30 \ (bottom_left면 양수로, bottom_right면 음수로)
+#   arena_safety_margin_m:=0.30 \
+#   initial_scan_radius_m:=1.00 \
+#   rescan_radius_m:=0.50 \
+#   homing_waypoint_step_m:=0.50 \
+#   homing_zigzag_offset_m:=0.15 \
+#   vision_near_zone_width_m:=0.60 \
+#   forward_cruise:=0.25
+
+
 def generate_launch_description():
-    use_sim_time = LaunchConfiguration("use_sim_time")
-    odometry_topic = LaunchConfiguration("odometry_topic")
-    snr_topic = LaunchConfiguration("snr_topic")
-    state_topic = LaunchConfiguration("state_topic")
-    waypoint_topic = LaunchConfiguration("waypoint_topic")
-    scan_center_topic = LaunchConfiguration("scan_center_topic")
-    region_gradient_topic = LaunchConfiguration("region_gradient_topic")
-    rolling_gradient_topic = LaunchConfiguration("rolling_gradient_topic")
-    snr_trend_topic = LaunchConfiguration("snr_trend_topic")
-    rc_override_topic = LaunchConfiguration("rc_override_topic")
+    use_sim_time = LaunchConfiguration("use_sim_time")  # 시뮬 시계
+    odometry_topic = LaunchConfiguration("odometry_topic")  # odometry 입력
+    snr_topic = LaunchConfiguration("snr_topic")  # SNR 입력
+    state_topic = LaunchConfiguration("state_topic")  # 제어 상태
+    waypoint_topic = LaunchConfiguration("waypoint_topic")  # 현재 waypoint
+    scan_center_topic = LaunchConfiguration("scan_center_topic")  # 스캔 중심
+    region_gradient_topic = LaunchConfiguration("region_gradient_topic")  # 스캔 그래디언트
+    rolling_gradient_topic = LaunchConfiguration("rolling_gradient_topic")  # 롤링 그래디언트
+    rc_override_topic = LaunchConfiguration("rc_override_topic")  # RC override 출력
 
     float_names = [
-        ("arena_length_m", "15.0"),
-        ("arena_width_m", "16.0"),
-        ("arena_offset_x_m", "0.0"),
-        ("arena_offset_y_m", "0.0"),
-        ("arena_safety_margin_m", "0.5"),
-        ("initial_scan_radius_m", "1.5"),
-        ("rescan_radius_m", "0.7"),
-        ("homing_waypoint_step_m", "0.8"),
-        ("homing_zigzag_offset_m", "0.2"),
-        ("rolling_gradient_alpha", "0.15"),
-        ("waypoint_reach_tolerance_m", "0.15"),
-        ("waypoint_dwell_s", "0.1"),
-        ("region_sample_spacing_m", "0.15"),
-        ("min_region_gradient_magnitude", "0.05"),
-        ("min_region_lateral_spread_m", "0.10"),
-        ("slope_decrease_threshold_db_per_m2", "1.0"),
-        ("vision_near_zone_width_m", "2.0"),
-        ("odometry_timeout_s", "0.5"),
-        ("max_snr_odom_skew_s", "0.15"),
-        ("forward_gain", "0.8"),
-        ("forward_limit", "0.5"),
-        ("yaw_gain", "1.15"),
-        ("yaw_limit", "0.72"),
-        ("move_heading_tolerance_rad", "0.35"),
-        ("vision_heading_tolerance_rad", "0.12"),
-        ("rc_pwm_span", "400.0"),
-        ("rate_hz", "30.0"),
+        ("arena_length_m", "15.0"),  # 수조 길이
+        ("arena_width_m", "16.0"),  # 수조 너비
+        ("arena_offset_x_m", "0.0"),  # 수조 원점 X 오프셋
+        ("arena_offset_y_m", "0.0"),  # 수조 원점 Y 오프셋
+        ("arena_safety_margin_m", "0.5"),  # 벽으로부터의 안전 여유
+        ("initial_scan_radius_m", "1.5"),  # 최초 원형 스캔 반경
+        ("rescan_radius_m", "0.7"),  # 재스캔 원형 반경
+        ("homing_waypoint_step_m", "0.8"),  # 호밍 한 스텝 전진 거리
+        ("homing_zigzag_offset_m", "0.2"),  # 호밍 좌우 지그재그 오프셋
+        ("rolling_gradient_alpha", "0.15"),  # 롤링 그래디언트 방향 스무딩 비율
+        ("rolling_gradient_conflict_angle_rad", "1.0472"),  # 방향 충돌 판정 각도 (60도)
+        ("waypoint_reach_tolerance_m", "0.15"),  # waypoint 도착 판정 반경
+        ("scan_radial_kp", "1.5"),  # 원형스캔 반경 오차 P 게인
+        ("scan_radial_ki", "0.05"),  # 원형스캔 반경 오차 I 게인
+        ("scan_radial_kd", "0.3"),  # 원형스캔 반경 오차 D 게인
+        ("scan_radial_integral_limit", "1.0"),  # 반경 오차 적분 제한
+        ("region_sample_spacing_m", "0.15"),  # SNR 샘플 최소 간격
+        ("min_region_gradient_magnitude", "0.05"),  # 유효 그래디언트 최소 크기
+        ("min_region_lateral_spread_m", "0.10"),  # 유효 피팅용 최소 횡방향 퍼짐
+        ("vision_near_zone_width_m", "2.0"),  # 비전 인계용 근접 구간 폭
+        ("target_depth_z_m", "-0.65"),  # 목표 수심 (odom z)
+        ("odometry_timeout_s", "0.5"),  # odometry 신선도 타임아웃
+        ("max_snr_odom_skew_s", "0.15"),  # SNR-odometry 시각 허용 오차
+        ("forward_cruise", "0.5"),  # 정렬 후 전진 RC 명령 크기
+        ("yaw_kp", "1.15"),  # yaw 오차 비례 게인
+        ("yaw_ki", "0.15"),  # 지속 yaw 오차 제거용 적분 게인
+        ("yaw_kd", "0.08"),  # yaw 오차 변화 감쇠 게인
+        ("yaw_integral_limit", "2.0"),  # yaw 적분 누적 제한 (rad*s)
+        ("yaw_limit", "0.72"),  # yaw 명령 최대 크기
+        ("move_heading_tolerance_rad", "0.1745"),  # 전진 허용 헤딩 오차
+        ("vision_heading_tolerance_rad", "0.12"),  # Vision 확인 중 전진 허용 헤딩 오차
+        ("rc_pwm_span", "400.0"),  # RC 중립±PWM 스팬
+        ("rate_hz", "30.0"),  # 제어 루프 주기
     ]
     int_names = [
-        ("region_scan_waypoint_count", "8"),
-        ("homing_slope_window_size", "12"),
-        ("min_homing_slope_samples", "5"),
-        ("min_homing_gradient_samples", "8"),
-        ("slope_decrease_limit", "5"),
+        ("homing_gradient_window_size", "12"),  # 롤링 그래디언트 윈도우 크기
+        ("min_homing_gradient_samples", "8"),  # 롤링 그래디언트 피팅 최소 샘플 수
+        ("rolling_gradient_conflict_limit", "3"),  # 큰 방향 충돌 연속 허용 횟수
     ]
     values = {name: LaunchConfiguration(name) for name, _ in float_names + int_names}
 
     arguments = [
-        DeclareLaunchArgument("use_sim_time", default_value="false"),
-        DeclareLaunchArgument("odometry_topic", default_value="/odometry/filtered"),
+        DeclareLaunchArgument("use_sim_time", default_value="false"),  # 시뮬 시계 사용 여부
+        DeclareLaunchArgument(
+            "odometry_topic", default_value="/odometry/filtered"
+        ),  # 입력 odometry 토픽
         DeclareLaunchArgument(
             "snr_topic", default_value="/audio_frequency_detector/snr_db_stamped"
-        ),
-        DeclareLaunchArgument("state_topic", default_value="/homing/control_state"),
+        ),  # 입력 SNR 토픽
+        DeclareLaunchArgument(
+            "state_topic", default_value="/homing/control_state"
+        ),  # 제어 상태 토픽
         DeclareLaunchArgument(
             "waypoint_topic", default_value="/homing/current_waypoint"
-        ),
-        DeclareLaunchArgument("scan_center_topic", default_value="/homing/scan_center"),
+        ),  # 현재 목표 waypoint 토픽
+        DeclareLaunchArgument(
+            "scan_center_topic", default_value="/homing/scan_center"
+        ),  # 원형 스캔 중심 토픽
         DeclareLaunchArgument(
             "vision_search_request_topic",
             default_value="/homing/vision_search_active",
-        ),
+        ),  # 비전 탐색 활성화 요청 토픽
         DeclareLaunchArgument(
             "target_confirmed_topic", default_value="/vision/target_confirmed"
-        ),
+        ),  # Vision 타깃 확정 응답 토픽
+        # [ACOUSTIC-VISION HANDSHAKE] Vision은 이 승인 후에만 RC를 발행한다.
+        DeclareLaunchArgument(
+            "vision_control_granted_topic",
+            default_value="/homing/vision_control_granted",
+        ),  # 비전 RC 제어 승인 토픽
         DeclareLaunchArgument(
             "region_gradient_topic", default_value="/homing/region_gradient"
-        ),
+        ),  # 원형 스캔 그래디언트 토픽
         DeclareLaunchArgument(
             "rolling_gradient_topic", default_value="/homing/rolling_gradient"
-        ),
+        ),  # 호밍 중 롤링 그래디언트 토픽
         DeclareLaunchArgument(
             "homing_direction_topic", default_value="/homing/homing_direction"
+        ),  # 실제 호밍 진행 방향 토픽
+        DeclareLaunchArgument(
+            "rc_override_topic", default_value="/mavros/rc/override"
+        ),  # MAVROS RC override 출력 토픽
+        DeclareLaunchArgument(
+            "emergency_stop_topic", default_value="/mission/emergency_stop"
         ),
-        DeclareLaunchArgument("snr_trend_topic", default_value="/homing/snr_trend"),
-        DeclareLaunchArgument("rc_override_topic", default_value="/mavros/rc/override"),
+        DeclareLaunchArgument("enable_keyboard_emergency_stop", default_value="true"),
+        DeclareLaunchArgument("emergency_stop_key", default_value="s"),
         DeclareLaunchArgument(
             "arena_start_corner",
             default_value="bottom_left",
@@ -92,9 +129,13 @@ def generate_launch_description():
                 "bottom_left (inside=-Y) or bottom_right (inside=+Y); "
                 "initial heading is always arena +X."
             ),
-        ),
-        DeclareLaunchArgument("invert_rc_yaw", default_value="true"),
-        DeclareLaunchArgument("vision_handoff_enabled", default_value="true"),
+        ),  # 수조 시작 코너 (안쪽 Y 부호 결정)
+        DeclareLaunchArgument(
+            "invert_rc_yaw", default_value="true"
+        ),  # RC yaw 채널 부호 반전
+        DeclareLaunchArgument(
+            "vision_handoff_enabled", default_value="true"
+        ),  # 근접 구간에서 비전 인계 사용 여부
     ]
     arguments += [
         DeclareLaunchArgument(name, default_value=default)
@@ -107,7 +148,6 @@ def generate_launch_description():
         "state_topic": state_topic,
         "region_gradient_topic": region_gradient_topic,
         "rolling_gradient_topic": rolling_gradient_topic,
-        "snr_trend_topic": snr_trend_topic,
     }
     estimator_parameters = {
         **common_topics,
@@ -115,11 +155,8 @@ def generate_launch_description():
         "region_sample_spacing_m": ParameterValue(
             values["region_sample_spacing_m"], value_type=float
         ),
-        "homing_slope_window_size": ParameterValue(
-            values["homing_slope_window_size"], value_type=int
-        ),
-        "min_homing_slope_samples": ParameterValue(
-            values["min_homing_slope_samples"], value_type=int
+        "homing_gradient_window_size": ParameterValue(
+            values["homing_gradient_window_size"], value_type=int
         ),
         "min_homing_gradient_samples": ParameterValue(
             values["min_homing_gradient_samples"], value_type=int
@@ -145,8 +182,16 @@ def generate_launch_description():
             "vision_search_request_topic"
         ),
         "target_confirmed_topic": LaunchConfiguration("target_confirmed_topic"),
+        "vision_control_granted_topic": LaunchConfiguration(
+            "vision_control_granted_topic"
+        ),
         "homing_direction_topic": LaunchConfiguration("homing_direction_topic"),
         "rc_override_topic": rc_override_topic,
+        "emergency_stop_topic": LaunchConfiguration("emergency_stop_topic"),
+        "enable_keyboard_emergency_stop": ParameterValue(
+            LaunchConfiguration("enable_keyboard_emergency_stop"), value_type=bool
+        ),
+        "emergency_stop_key": LaunchConfiguration("emergency_stop_key"),
         "arena_start_corner": LaunchConfiguration("arena_start_corner"),
         "invert_rc_yaw": ParameterValue(
             LaunchConfiguration("invert_rc_yaw"), value_type=bool
@@ -166,14 +211,20 @@ def generate_launch_description():
         "homing_waypoint_step_m",
         "homing_zigzag_offset_m",
         "rolling_gradient_alpha",
+        "rolling_gradient_conflict_angle_rad",
         "waypoint_reach_tolerance_m",
-        "waypoint_dwell_s",
-        "slope_decrease_threshold_db_per_m2",
+        "scan_radial_kp",
+        "scan_radial_ki",
+        "scan_radial_kd",
+        "scan_radial_integral_limit",
         "vision_near_zone_width_m",
+        "target_depth_z_m",
         "odometry_timeout_s",
-        "forward_gain",
-        "forward_limit",
-        "yaw_gain",
+        "forward_cruise",
+        "yaw_kp",
+        "yaw_ki",
+        "yaw_kd",
+        "yaw_integral_limit",
         "yaw_limit",
         "move_heading_tolerance_rad",
         "vision_heading_tolerance_rad",
@@ -182,8 +233,7 @@ def generate_launch_description():
     ]:
         controller_parameters[name] = ParameterValue(values[name], value_type=float)
     for name in [
-        "region_scan_waypoint_count",
-        "slope_decrease_limit",
+        "rolling_gradient_conflict_limit",
     ]:
         controller_parameters[name] = ParameterValue(values[name], value_type=int)
 

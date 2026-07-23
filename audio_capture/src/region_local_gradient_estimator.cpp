@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -17,8 +18,7 @@
 
 namespace audio_capture
 {
-// Region Scan에서는 현재 원형 경로의 표본만으로 2D Gradient를 계산하고,
-// Homing에서는 별도 Rolling Window로 이동거리 대비 SNR slope를 계산한다.
+// Region Scan과 Homing의 거리 기반 SNR 표본으로 각각 2D Gradient를 계산한다.
 class RegionLocalGradientEstimatorNode : public rclcpp::Node
 {
 public:
@@ -36,20 +36,16 @@ public:
             "region_gradient_topic", "/homing/region_gradient");
         const auto rolling_gradient_topic = declare_parameter<std::string>(
             "rolling_gradient_topic", "/homing/rolling_gradient");
-        const auto snr_trend_topic = declare_parameter<std::string>(
-            "snr_trend_topic", "/homing/snr_trend");
         region_sample_spacing_m_ = std::max(
             0.01, declare_parameter<double>("region_sample_spacing_m", 0.15));
-        homing_slope_window_size_ = static_cast<std::size_t>(std::max<std::int64_t>(
+        homing_gradient_window_size_ =
+            static_cast<std::size_t>(std::max<std::int64_t>(
             3,
-            declare_parameter<std::int64_t>("homing_slope_window_size", 12)));
-        min_homing_slope_samples_ = static_cast<std::size_t>(std::clamp<std::int64_t>(
-            declare_parameter<std::int64_t>("min_homing_slope_samples", 5),
-            3, static_cast<std::int64_t>(homing_slope_window_size_)));
+            declare_parameter<std::int64_t>("homing_gradient_window_size", 12)));
         min_homing_gradient_samples_ = static_cast<std::size_t>(
             std::clamp<std::int64_t>(
                 declare_parameter<std::int64_t>("min_homing_gradient_samples", 8),
-                3, static_cast<std::int64_t>(homing_slope_window_size_)));
+                3, static_cast<std::int64_t>(homing_gradient_window_size_)));
         min_region_gradient_magnitude_ = std::max(
             0.0, declare_parameter<double>("min_region_gradient_magnitude", 0.05));
         min_region_lateral_spread_m_ = std::max(
@@ -76,15 +72,12 @@ public:
         rolling_gradient_pub_ =
             create_publisher<geometry_msgs::msg::Vector3Stamped>(
                 rolling_gradient_topic, 10);
-        snr_trend_pub_ = create_publisher<geometry_msgs::msg::Vector3Stamped>(
-            snr_trend_topic, 10);
 
         RCLCPP_INFO(
             get_logger(),
-            "Region Gradient/SNR trend estimator ready: spacing=%.2f m "
-            "slope_samples=%zu..%zu.",
-            region_sample_spacing_m_, min_homing_slope_samples_,
-            homing_slope_window_size_);
+            "Region/Rolling Gradient estimator ready: spacing=%.2f m "
+            "homing_window=%zu samples.",
+            region_sample_spacing_m_, homing_gradient_window_size_);
     }
 
 
@@ -94,7 +87,6 @@ private:
     {
         Eigen::Vector2d position{0.0, 0.0};
         double snr_db = 0.0;
-        double path_distance_m = 0.0;
     };
 
     struct PoseSample
@@ -126,7 +118,6 @@ private:
         }
         odometry_frame_ = msg->header.frame_id.empty() ? "odom" : msg->header.frame_id; // 오돔 메세지가 어느 좌표계 기준인지 업데이트한다 (빈 문자열이면 odom 기준).
         last_odometry_receive_time_ = now(); // 마지막 오도메트리 수신 시간을 업데이트한다.
-        have_odometry_ = true; // 오도메트리 수신 여부를 업데이트한다.
     }
 
 
@@ -140,9 +131,9 @@ private:
         state_ = msg->data;
         if (state_ == "REGION_SCAN") {
             scan_samples_.clear();
-            reset_homing_trend();
-        } else if (state_ == "REGION_HOMING") {
-            reset_homing_trend();
+        }
+        if (state_ == "REGION_SCAN" || state_ == "REGION_HOMING") {
+            reset_homing_window();
         }
     }
 
@@ -176,7 +167,7 @@ private:
         {
             return;
         }
-        scan_samples_.push_back({position, snr_db, 0.0});
+        scan_samples_.push_back({position, snr_db});
         RCLCPP_DEBUG(
             get_logger(), "REGION_SCAN sample stored: count=%zu position=(%.2f, %.2f) "
             "snr=%.2f dB", scan_samples_.size(),
@@ -203,27 +194,25 @@ private:
     void record_homing_sample(
         const rclcpp::Time & stamp, const Eigen::Vector2d & position, const double snr_db)
     {
-        if (!have_last_homing_position_) {
+        if (!last_homing_position_) {
             last_homing_position_ = position;
-            have_last_homing_position_ = true;
         } else {
-            const double displacement = (position - last_homing_position_).norm();
+            const double displacement =
+                (position - *last_homing_position_).norm();
             if (displacement < region_sample_spacing_m_) {
                 return;
             }
-            homing_path_distance_m_ += displacement;
             last_homing_position_ = position;
         }
 
-        homing_samples_.push_back({position, snr_db, homing_path_distance_m_});
-        while (homing_samples_.size() > homing_slope_window_size_) {
+        homing_samples_.push_back({position, snr_db});
+        while (homing_samples_.size() > homing_gradient_window_size_) {
             homing_samples_.pop_front();
         }
         RCLCPP_DEBUG(
             get_logger(),
-            "REGION_HOMING sample stored: window=%zu/%zu distance=%.2f m snr=%.2f dB",
-            homing_samples_.size(), homing_slope_window_size_,
-            homing_path_distance_m_, snr_db);
+            "REGION_HOMING sample stored: window=%zu/%zu snr=%.2f dB",
+            homing_samples_.size(), homing_gradient_window_size_, snr_db);
         if (homing_samples_.size() >= min_homing_gradient_samples_) {
             const std::vector<Sample> samples(
                 homing_samples_.begin(), homing_samples_.end());
@@ -234,62 +223,12 @@ private:
                 publish_gradient(rolling_gradient_pub_, stamp, gradient);
             }
         }
-        if (homing_samples_.size() < min_homing_slope_samples_) {
-            return;
-        }
-
-        double slope = 0.0;
-        if (!fit_slope(slope)) {
-            return;
-        }
-        double slope_change = 0.0;
-        if (have_previous_slope_) {
-            const double distance_delta =
-                homing_path_distance_m_ - previous_slope_distance_m_;
-            if (distance_delta > 1.0e-6) {
-                slope_change = (slope - previous_slope_) / distance_delta;
-            }
-        }
-        previous_slope_ = slope;
-        previous_slope_distance_m_ = homing_path_distance_m_;
-        have_previous_slope_ = true;
-        publish_snr_trend(stamp, slope, slope_change);
     }
 
-    bool fit_slope(double & slope) const
-    {
-        double mean_distance = 0.0;
-        double mean_snr = 0.0;
-        for (const Sample & sample : homing_samples_) {
-            mean_distance += sample.path_distance_m;
-            mean_snr += sample.snr_db;
-        }
-        const double count = static_cast<double>(homing_samples_.size());
-        mean_distance /= count;
-        mean_snr /= count;
-
-        double covariance = 0.0;
-        double distance_variance = 0.0;
-        for (const Sample & sample : homing_samples_) {
-            const double distance_delta = sample.path_distance_m - mean_distance;
-            covariance += distance_delta * (sample.snr_db - mean_snr);
-            distance_variance += distance_delta * distance_delta;
-        }
-        if (distance_variance <= 1.0e-9) {
-            return false;
-        }
-        slope = covariance / distance_variance;
-        return std::isfinite(slope);
-    }
-
-    void reset_homing_trend()
+    void reset_homing_window()
     {
         homing_samples_.clear();
-        have_last_homing_position_ = false;
-        have_previous_slope_ = false;
-        homing_path_distance_m_ = 0.0;
-        previous_slope_ = 0.0;
-        previous_slope_distance_m_ = 0.0;
+        last_homing_position_.reset();
     }
 
     bool fit_gradient(
@@ -402,7 +341,7 @@ private:
 
     bool odometry_is_fresh() const
     {
-        return have_odometry_ &&
+        return !odometry_history_.empty() &&
             (now() - last_odometry_receive_time_).seconds() <= odometry_timeout_s_;
     }
 
@@ -419,26 +358,9 @@ private:
         publisher->publish(msg);
     }
 
-    void publish_snr_trend(
-        const rclcpp::Time & stamp,
-        const double slope,
-        const double slope_change) const
-    {
-        geometry_msgs::msg::Vector3Stamped msg;
-        msg.header.stamp = stamp;
-        msg.header.frame_id = odometry_frame_;
-        msg.vector.x = slope;
-        msg.vector.y = slope_change;
-        snr_trend_pub_->publish(msg);
-        RCLCPP_INFO(
-            get_logger(), "[SLOPE] slope=%.3f dB/m change=%.3f dB/m^2",
-            slope, slope_change);
-    }
-
     // TODO: 안정된 수평 최대 SNR 영역 판단과 Depth Sweep은 다음 단계에서 추가한다.
 
-    std::size_t homing_slope_window_size_ = 12;
-    std::size_t min_homing_slope_samples_ = 5;
+    std::size_t homing_gradient_window_size_ = 12;
     std::size_t min_homing_gradient_samples_ = 8;
     double region_sample_spacing_m_ = 0.15;
     double min_region_gradient_magnitude_ = 0.05;
@@ -448,14 +370,8 @@ private:
 
     std::string state_;
     std::string odometry_frame_ = "odom";
-    bool have_odometry_ = false;
-    bool have_last_homing_position_ = false;
-    bool have_previous_slope_ = false;
     rclcpp::Time last_odometry_receive_time_;
-    double homing_path_distance_m_ = 0.0;
-    double previous_slope_ = 0.0;
-    double previous_slope_distance_m_ = 0.0;
-    Eigen::Vector2d last_homing_position_{0.0, 0.0};
+    std::optional<Eigen::Vector2d> last_homing_position_;
     std::deque<PoseSample> odometry_history_; //위치와 해당 시각을 저장하는 큐
     std::vector<Sample> scan_samples_;
     std::deque<Sample> homing_samples_;
@@ -465,7 +381,6 @@ private:
     rclcpp::Subscription<std_msgs::msg::String>::SharedPtr state_sub_;
     rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr region_gradient_pub_;
     rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr rolling_gradient_pub_;
-    rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr snr_trend_pub_;
 };
 }  // namespace audio_capture
 

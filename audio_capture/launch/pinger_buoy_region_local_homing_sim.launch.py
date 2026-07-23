@@ -26,38 +26,82 @@ def generate_launch_description():
     sim_arena_yaw_rad = LaunchConfiguration("sim_arena_yaw_rad")
     launch_rviz = LaunchConfiguration("launch_rviz")
 
+    # 현재 활성값은 15 x 16 x 11 m 대회장용이다.
+    #
+    # 5.49 x 2.74 x 1.32 m 실험 수조로 바꿀 때 아래 값으로 교체한다.
+    # AUV 시작 odom (0, 0)을 +X/-Y 벽에서 각각 0.30 m 안쪽으로 둔
+    # bottom_left 기준이며, 수조 폭이 좁아서 초기 원형 탐색 반경은 1.0 m로 제한한다.
+    #
+    # ("arena_length_m", "5.49"),
+    # ("arena_width_m", "2.74"),
+    # ("arena_offset_x_m", "-0.30"),
+    # ("arena_offset_y_m", "0.30"),
+    # ("arena_safety_margin_m", "0.20"),
+    # ("initial_scan_radius_m", "1.00"),
+    # ("rescan_radius_m", "0.50"),
+    # ("homing_waypoint_step_m", "0.50"),
+    # ("homing_zigzag_offset_m", "0.15"),
+    # ("vision_near_zone_width_m", "0.60"),
+    # ("target_depth_z_m", "-0.65"),
+    # ("pinger_x", "2.20"),
+    # ("pinger_y", "-1.00"),
+    # ("pinger_z", "-1.00"),
+    #
+    # 위 pinger 좌표는 scene.xml 실험 수조 프리셋의 pinger_source와 같다.
+    # AUV의 시작 z도 실험 수조 범위인 -1.32~0 m 안으로 별도 이동해야 한다.
     homing_float_names = [
-        ("arena_length_m", "15.0"),
-        ("arena_width_m", "16.0"),
-        # 15 x 16 m 경기장의 +Y/-X 코너에서 0.55 m 안쪽인 AUV 시작점을
-        # odom (0,0)으로 변환한 경기장 경계 오프셋.
-        ("arena_offset_x_m", "-0.55"),
-        ("arena_offset_y_m", "0.55"),
-        ("arena_safety_margin_m", "0.55"),
-        ("initial_scan_radius_m", "1.50"),
-        ("rescan_radius_m", "0.70"),
-        ("homing_waypoint_step_m", "0.80"),
-        ("homing_zigzag_offset_m", "0.20"),
+
+        # 대회장용
+        # ("arena_length_m", "15.0"),
+        # ("arena_width_m", "16.0"),
+        # # 15 x 16 m 경기장의 +Y/-X 코너에서 0.55 m 안쪽인 AUV 시작점을
+        # # odom (0,0)으로 변환한 경기장 경계 오프셋.
+        # ("arena_offset_x_m", "-0.55"),
+        # ("arena_offset_y_m", "0.55"),
+        # ("arena_safety_margin_m", "0.55"),
+        # ("initial_scan_radius_m", "1.50"),
+        # ("rescan_radius_m", "0.70"),
+        # ("homing_waypoint_step_m", "0.80"),
+        # ("homing_zigzag_offset_m", "0.20"),
+        # ("target_depth_z_m", "-8.00"),
+
+        # 실험 수조용
+        ("arena_length_m", "5.49"),
+        ("arena_width_m", "2.74"),
+        ("arena_offset_x_m", "-0.30"),
+        ("arena_offset_y_m", "0.30"),
+        ("arena_safety_margin_m", "0.40"),
+        ("initial_scan_radius_m", "0.70"),
+        ("rescan_radius_m", "0.50"),
+        ("homing_waypoint_step_m", "0.50"),
+        ("homing_zigzag_offset_m", "0.15"),
+        ("target_depth_z_m", "-0.65"),
+
         ("rolling_gradient_alpha", "0.15"),
+        ("rolling_gradient_conflict_angle_rad", "1.0472"),
         ("waypoint_reach_tolerance_m", "0.15"),
-        ("waypoint_dwell_s", "0.1"),
+        ("scan_radial_kp", "1.5"),
+        ("scan_radial_ki", "0.05"),
+        ("scan_radial_kd", "0.3"),
+        ("scan_radial_integral_limit", "1.0"),
         ("region_sample_spacing_m", "0.15"),
         ("min_region_gradient_magnitude", "0.05"),
         ("min_region_lateral_spread_m", "0.10"),
-        ("slope_decrease_threshold_db_per_m2", "1.0"),
-        ("vision_near_zone_width_m", "2.0"),
-        ("forward_gain", "1.4"),
-        ("forward_limit", "0.45"),
-        ("yaw_gain", "1.15"),
+        ("vision_near_zone_width_m", "0.60"),
+        # ("vision_near_zone_width_m", "2.0"),
+        ("forward_cruise", "0.70"),
+        ("yaw_kp", "1.00"),
+        ("yaw_ki", "0.15"),
+        ("yaw_kd", "0.08"),
+        ("yaw_integral_limit", "2.0"),
         ("yaw_limit", "0.72"),
+        ("move_heading_tolerance_rad", "0.1745"),
         ("vision_heading_tolerance_rad", "0.12"),
     ]
     homing_int_names = [
-        ("region_scan_waypoint_count", "8"),
-        ("homing_slope_window_size", "12"),
-        ("min_homing_slope_samples", "5"),
+        ("homing_gradient_window_size", "12"),
         ("min_homing_gradient_samples", "8"),
-        ("slope_decrease_limit", "5"),
+        ("rolling_gradient_conflict_limit", "3"),
     ]
     homing_values = {
         name: LaunchConfiguration(name)
@@ -87,9 +131,10 @@ def generate_launch_description():
             default_value="/home/kim/new_hydrophone_ws/localization_20260719_185918",
         ),
         DeclareLaunchArgument("frequency_hz", default_value="21164.0"),
-        DeclareLaunchArgument("pinger_x", default_value="0.0"),
-        DeclareLaunchArgument("pinger_y", default_value="-7.28"),
-        DeclareLaunchArgument("pinger_z", default_value="-10.95"),
+        # scene.xml 실험 수조 프리셋의 pinger_source world 좌표.
+        DeclareLaunchArgument("pinger_x", default_value="2.20"),
+        DeclareLaunchArgument("pinger_y", default_value="-1.00"),
+        DeclareLaunchArgument("pinger_z", default_value="-0.65"),
         DeclareLaunchArgument("source_amplitude", default_value="0.03"),
         DeclareLaunchArgument("clean_noise_amplitude", default_value="0.001"),
         DeclareLaunchArgument("minimum_distance_m", default_value="0.5"),
@@ -105,6 +150,11 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "target_confirmed_topic", default_value="/vision/target_confirmed"
         ),
+        # [ACOUSTIC-VISION HANDSHAKE] Acoustic RC 종료 후 Vision 제어를 승인한다.
+        DeclareLaunchArgument(
+            "vision_control_granted_topic",
+            default_value="/homing/vision_control_granted",
+        ),
         DeclareLaunchArgument(
             "rolling_gradient_topic", default_value="/homing/rolling_gradient"
         ),
@@ -113,8 +163,13 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument("rc_override_topic", default_value="/mavros/rc/override"),
         DeclareLaunchArgument(
+            "emergency_stop_topic", default_value="/mission/emergency_stop"
+        ),
+        DeclareLaunchArgument("enable_keyboard_emergency_stop", default_value="true"),
+        DeclareLaunchArgument("emergency_stop_key", default_value="s"),
+        DeclareLaunchArgument(
             "launch_rviz",
-            default_value="false",
+            default_value="true",
             description="true이면 V3 SNR map/gradient RViz를 함께 실행한다.",
         ),
     ]
@@ -193,6 +248,9 @@ def generate_launch_description():
             "target_confirmed_topic": LaunchConfiguration(
                 "target_confirmed_topic"
             ),
+            "vision_control_granted_topic": LaunchConfiguration(
+                "vision_control_granted_topic"
+            ),
             "rolling_gradient_topic": LaunchConfiguration(
                 "rolling_gradient_topic"
             ),
@@ -200,6 +258,11 @@ def generate_launch_description():
                 "homing_direction_topic"
             ),
             "rc_override_topic": LaunchConfiguration("rc_override_topic"),
+            "emergency_stop_topic": LaunchConfiguration("emergency_stop_topic"),
+            "enable_keyboard_emergency_stop": LaunchConfiguration(
+                "enable_keyboard_emergency_stop"
+            ),
+            "emergency_stop_key": LaunchConfiguration("emergency_stop_key"),
             **homing_values,
         }.items(),
     )
