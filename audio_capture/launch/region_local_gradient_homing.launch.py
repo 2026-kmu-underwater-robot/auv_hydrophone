@@ -75,8 +75,7 @@ def generate_launch_description():
         ),  # 제어 상태 토픽
         DeclareLaunchArgument(
             "waypoint_topic", default_value="/waypoint"
-        ),  # 현재 목표 waypoint 토픽
-        DeclareLaunchArgument("arena_frame_id", default_value="arena"),
+        ),  # odom 절대좌표 PositionTarget waypoint 토픽
         DeclareLaunchArgument(
             "scan_center_topic", default_value="/homing/scan_center"
         ),  # 원형 스캔 중심 토픽
@@ -167,7 +166,6 @@ def generate_launch_description():
             "vision_control_granted_topic"
         ),
         "homing_direction_topic": LaunchConfiguration("homing_direction_topic"),
-        "arena_frame_id": LaunchConfiguration("arena_frame_id"),
         "emergency_stop_topic": LaunchConfiguration("emergency_stop_topic"),
         "enable_keyboard_emergency_stop": ParameterValue(
             LaunchConfiguration("enable_keyboard_emergency_stop"), value_type=bool

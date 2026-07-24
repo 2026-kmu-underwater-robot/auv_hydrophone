@@ -10,8 +10,7 @@ def generate_launch_description():
         ("odometry_topic", "/odometry/filtered"),
         ("snr_topic", "/audio_frequency_detector/snr_db_stamped"),
         ("state_topic", "/homing/control_state"),
-        ("waypoint_topic", "/waypoint"),
-        ("arena_frame_id", "arena"),
+        ("waypoint_topic", "/waypoint"),  # odom 절대좌표 PositionTarget
         ("peak_topic", "/homing/snr_peak_position"),
         ("vision_search_request_topic", "/homing/vision_search_active"),
         ("target_confirmed_topic", "/vision/target_confirmed"),

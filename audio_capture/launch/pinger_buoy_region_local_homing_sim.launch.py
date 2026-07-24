@@ -149,7 +149,6 @@ def generate_launch_description():
         DeclareLaunchArgument("attenuation_power", default_value="2.0"),
         DeclareLaunchArgument("sound_speed_mps", default_value="1500.0"),
         DeclareLaunchArgument("arena_start_corner", default_value="bottom_left"),
-        DeclareLaunchArgument("arena_frame_id", default_value="arena"),
         DeclareLaunchArgument("vision_handoff_enabled", default_value="true"),
         DeclareLaunchArgument(
             "vision_search_request_topic",
@@ -251,7 +250,6 @@ def generate_launch_description():
             "use_sim_time": use_sim_time,
             "odometry_topic": homing_odometry_topic,
             "arena_start_corner": LaunchConfiguration("arena_start_corner"),
-            "arena_frame_id": LaunchConfiguration("arena_frame_id"),
             "vision_handoff_enabled": LaunchConfiguration(
                 "vision_handoff_enabled"
             ),
@@ -304,7 +302,6 @@ def generate_launch_description():
             "use_sim_time": use_sim_time,
             "odometry_topic": homing_odometry_topic,
             "arena_start_corner": LaunchConfiguration("arena_start_corner"),
-            "arena_frame_id": LaunchConfiguration("arena_frame_id"),
             "arena_length_m": LaunchConfiguration("arena_length_m"),
             "arena_width_m": LaunchConfiguration("arena_width_m"),
             "arena_offset_x_m": LaunchConfiguration("arena_offset_x_m"),
@@ -374,7 +371,6 @@ def generate_launch_description():
                 "vision_near_zone_width_m"
             ),
             "arena_start_corner": LaunchConfiguration("arena_start_corner"),
-            "arena_frame_id": LaunchConfiguration("arena_frame_id"),
             "map_cell_size_m": LaunchConfiguration(
                 "region_sample_spacing_m"
             ),

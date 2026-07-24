@@ -43,7 +43,6 @@ def generate_launch_description():
         DeclareLaunchArgument("arena_safety_margin_m", default_value="0.5"),
         DeclareLaunchArgument("vision_near_zone_width_m", default_value="2.0"),
         DeclareLaunchArgument("arena_start_corner", default_value="bottom_left"),
-        DeclareLaunchArgument("arena_frame_id", default_value="arena"),
         DeclareLaunchArgument("map_cell_size_m", default_value="0.15"),
         DeclareLaunchArgument("arrow_length_m", default_value="1.0"),
         DeclareLaunchArgument("publish_rate_hz", default_value="5.0"),
@@ -93,7 +92,6 @@ def generate_launch_description():
                     LaunchConfiguration("vision_near_zone_width_m"), value_type=float
                 ),
                 "arena_start_corner": LaunchConfiguration("arena_start_corner"),
-                "arena_frame_id": LaunchConfiguration("arena_frame_id"),
                 "map_cell_size_m": ParameterValue(
                     LaunchConfiguration("map_cell_size_m"), value_type=float
                 ),

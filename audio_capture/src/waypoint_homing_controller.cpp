@@ -18,6 +18,7 @@
 #include <Eigen/Dense>
 #include <geometry_msgs/msg/point_stamped.hpp>
 #include <geometry_msgs/msg/vector3_stamped.hpp>
+#include <mavros_msgs/msg/position_target.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_components/register_node_macro.hpp>
@@ -26,7 +27,7 @@
 
 namespace audio_capture
 {
-// odometry에서 경로를 생성하고 arena 좌표 waypoint로 변환해 외부 추종기에 전달한다.
+// odometry에서 경로를 생성하고 odom 절대좌표 waypoint를 외부 추종기에 전달한다.
 class WaypointHomingControllerNode : public rclcpp::Node
 {
 public:
@@ -46,8 +47,6 @@ public:
             "state_topic", "/homing/control_state");
         const auto waypoint_topic = declare_parameter<std::string>(
             "waypoint_topic", "/waypoint");
-        arena_frame_id_ = declare_parameter<std::string>(
-            "arena_frame_id", "arena");
         const auto scan_center_topic = declare_parameter<std::string>(
             "scan_center_topic", "/homing/scan_center");
         const auto vision_search_request_topic = declare_parameter<std::string>(
@@ -150,8 +149,8 @@ public:
                 std::placeholders::_1));
         state_pub_ = create_publisher<std_msgs::msg::String>(
             state_topic, rclcpp::QoS(1).reliable().transient_local());
-        waypoint_pub_ = create_publisher<geometry_msgs::msg::PointStamped>(
-            waypoint_topic, rclcpp::QoS(1).reliable().transient_local());
+        waypoint_pub_ = create_publisher<mavros_msgs::msg::PositionTarget>(
+            waypoint_topic, rclcpp::QoS(10).reliable());
         scan_center_pub_ = create_publisher<geometry_msgs::msg::PointStamped>(
             scan_center_topic, rclcpp::QoS(1).reliable().transient_local());
         vision_search_request_pub_ = create_publisher<std_msgs::msg::Bool>(
@@ -408,6 +407,9 @@ private:
     void control_loop()
     {
         const rclcpp::Time current_time = now(); // 현재 시간을 가져온다.
+        if (have_current_waypoint_ && state_ != State::HANDOFF_COMPLETE) {
+            publish_current_waypoint();
+        }
         if (emergency_stop_active_.load()) {
             if (!emergency_hold_published_ && have_odometry_) {
                 set_current_waypoint(current_position_);
@@ -713,12 +715,29 @@ private:
     void set_current_waypoint(const Eigen::Vector2d & waypoint)
     {
         current_waypoint_ = waypoint;
-        geometry_msgs::msg::PointStamped msg;
+        have_current_waypoint_ = true;
+        publish_current_waypoint();
+    }
+
+    void publish_current_waypoint()
+    {
+        mavros_msgs::msg::PositionTarget msg;
         msg.header.stamp = now();
-        msg.header.frame_id = arena_frame_id_;
-        msg.point.x = waypoint.x() - arena_offset_x_m_;
-        msg.point.y = waypoint.y() - arena_offset_y_m_;
-        msg.point.z = target_depth_z_m_;
+        msg.header.frame_id = odometry_frame_;
+        msg.coordinate_frame =
+            mavros_msgs::msg::PositionTarget::FRAME_LOCAL_NED;
+        msg.type_mask =
+            mavros_msgs::msg::PositionTarget::IGNORE_VX |
+            mavros_msgs::msg::PositionTarget::IGNORE_VY |
+            mavros_msgs::msg::PositionTarget::IGNORE_VZ |
+            mavros_msgs::msg::PositionTarget::IGNORE_AFX |
+            mavros_msgs::msg::PositionTarget::IGNORE_AFY |
+            mavros_msgs::msg::PositionTarget::IGNORE_AFZ |
+            mavros_msgs::msg::PositionTarget::IGNORE_YAW |
+            mavros_msgs::msg::PositionTarget::IGNORE_YAW_RATE;
+        msg.position.x = current_waypoint_.x();
+        msg.position.y = current_waypoint_.y();
+        msg.position.z = target_depth_z_m_;
         waypoint_pub_->publish(msg);
     }
 
@@ -894,7 +913,6 @@ private:
     std::size_t rolling_gradient_conflict_count_ = 0;
     double zigzag_sign_ = 1.0;
     std::string arena_start_corner_ = "bottom_left";
-    std::string arena_frame_id_ = "arena";
     std::string odometry_frame_ = "odom";
     bool vision_handoff_enabled_ = true;
     bool have_odometry_ = false;
@@ -902,6 +920,7 @@ private:
     bool vision_search_requested_ = false;
     bool first_region_scan_ = true;
     bool emergency_hold_published_ = false;
+    bool have_current_waypoint_ = false;
     std::string emergency_stop_key_ = "s";
     State state_ = State::MOVE_TO_SCAN_CENTER;
     RegionResultState region_result_state_ = RegionResultState::WAITING;
@@ -925,7 +944,7 @@ private:
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr target_confirmed_sub_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr emergency_stop_sub_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr state_pub_;
-    rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr waypoint_pub_;
+    rclcpp::Publisher<mavros_msgs::msg::PositionTarget>::SharedPtr waypoint_pub_;
     rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr scan_center_pub_;
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr vision_search_request_pub_;
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr vision_control_granted_pub_;

@@ -16,6 +16,7 @@
 #include <geometry_msgs/msg/point.hpp>
 #include <geometry_msgs/msg/point_stamped.hpp>
 #include <geometry_msgs/msg/vector3_stamped.hpp>
+#include <mavros_msgs/msg/position_target.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_components/register_node_macro.hpp>
@@ -50,9 +51,6 @@ public:
             "scan_center_topic", "/homing/scan_center");
         const auto marker_topic = declare_parameter<std::string>(
             "marker_topic", "/homing/rviz/markers");
-        arena_frame_id_ = declare_parameter<std::string>(
-            "arena_frame_id", "arena");
-
         arena_length_m_ = std::max(
             0.1, declare_parameter<double>("arena_length_m", 15.0));
         arena_width_m_ = std::max(
@@ -121,14 +119,10 @@ public:
             [this](const geometry_msgs::msg::Vector3Stamped::ConstSharedPtr msg) {
                 update_gradient(msg, homing_direction_, have_homing_direction_);
             });
-        waypoint_sub_ = create_subscription<geometry_msgs::msg::PointStamped>(
-            waypoint_topic, rclcpp::QoS(1).reliable().transient_local(),
-            [this](const geometry_msgs::msg::PointStamped::ConstSharedPtr msg) {
-                Eigen::Vector2d waypoint(msg->point.x, msg->point.y);
-                if (msg->header.frame_id == arena_frame_id_) {
-                    waypoint.x() += arena_offset_x_m_;
-                    waypoint.y() += arena_offset_y_m_;
-                }
+        waypoint_sub_ = create_subscription<mavros_msgs::msg::PositionTarget>(
+            waypoint_topic, rclcpp::QoS(10).reliable(),
+            [this](const mavros_msgs::msg::PositionTarget::ConstSharedPtr msg) {
+                const Eigen::Vector2d waypoint(msg->position.x, msg->position.y);
                 if (waypoint.allFinite()) {
                     current_waypoint_ = waypoint;
                     have_waypoint_ = true;
@@ -775,7 +769,6 @@ private:
     bool have_scan_center_ = false;
     std::string odometry_frame_ = "odom";
     std::string arena_start_corner_ = "bottom_left";
-    std::string arena_frame_id_ = "arena";
     Eigen::Vector2d current_position_{0.0, 0.0};
     Eigen::Vector2d current_waypoint_{0.0, 0.0};
     Eigen::Vector2d scan_center_{0.0, 0.0};
@@ -796,7 +789,7 @@ private:
         rolling_gradient_sub_;
     rclcpp::Subscription<geometry_msgs::msg::Vector3Stamped>::SharedPtr
         homing_direction_sub_;
-    rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr waypoint_sub_;
+    rclcpp::Subscription<mavros_msgs::msg::PositionTarget>::SharedPtr waypoint_sub_;
     rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr scan_center_sub_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
     rclcpp::TimerBase::SharedPtr timer_;
