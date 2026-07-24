@@ -52,6 +52,10 @@ def generate_launch_description():
         ("vision_near_zone_width_m", "2.0"),  # 비전 인계용 근접 구간 폭
         ("target_depth_z_m", "-0.65"),  # 목표 수심 (odom z)
         ("odometry_timeout_s", "0.5"),  # odometry 신선도 타임아웃
+        ("fcu_state_timeout_s", "1.0"),  # FCU 상태 신선도 타임아웃
+        ("handoff_hold_sec", "0.7"),  # 인계 전 정지 상태 유지 시간
+        ("handoff_max_speed_mps", "0.2"),  # 인계 허용 최대 속도
+        ("mode_request_interval_s", "1.0"),  # STABILIZE 재요청 간격
         ("max_snr_odom_skew_s", "0.15"),  # SNR-odometry 시각 허용 오차
         ("rate_hz", "30.0"),  # 제어 루프 주기
     ]
@@ -77,6 +81,9 @@ def generate_launch_description():
             "waypoint_topic", default_value="/waypoint"
         ),  # odom 절대좌표 PositionTarget waypoint 토픽
         DeclareLaunchArgument(
+            "arena_start_frame_topic", default_value="/guided/start_frame"
+        ),  # arena 원점과 +X 방향을 담은 odom pose
+        DeclareLaunchArgument(
             "scan_center_topic", default_value="/homing/scan_center"
         ),  # 원형 스캔 중심 토픽
         DeclareLaunchArgument(
@@ -91,6 +98,22 @@ def generate_launch_description():
             "vision_control_granted_topic",
             default_value="/homing/vision_control_granted",
         ),  # 비전 RC 제어 승인 토픽
+        DeclareLaunchArgument(
+            "guided_waypoint_enable_topic",
+            default_value="/guided/waypoint_enable",
+        ),  # 외부 waypoint 제어 활성화 토픽
+        DeclareLaunchArgument(
+            "guided_status_topic", default_value="/guided/status"
+        ),  # 외부 waypoint 제어기 상태 토픽
+        DeclareLaunchArgument(
+            "fcu_state_topic", default_value="/mavros/state"
+        ),  # FCU 모드 확인 토픽
+        DeclareLaunchArgument(
+            "set_mode_service", default_value="/mavros/set_mode"
+        ),  # FCU 모드 변경 서비스
+        DeclareLaunchArgument(
+            "vision_mode_name", default_value="STABILIZE"
+        ),  # 비전 RC 제어용 FCU 모드
         DeclareLaunchArgument(
             "region_gradient_topic", default_value="/homing/region_gradient"
         ),  # 원형 스캔 그래디언트 토픽
@@ -157,6 +180,9 @@ def generate_launch_description():
     controller_parameters = {
         **common_topics,
         "waypoint_topic": waypoint_topic,
+        "arena_start_frame_topic": LaunchConfiguration(
+            "arena_start_frame_topic"
+        ),
         "scan_center_topic": scan_center_topic,
         "vision_search_request_topic": LaunchConfiguration(
             "vision_search_request_topic"
@@ -165,6 +191,13 @@ def generate_launch_description():
         "vision_control_granted_topic": LaunchConfiguration(
             "vision_control_granted_topic"
         ),
+        "guided_waypoint_enable_topic": LaunchConfiguration(
+            "guided_waypoint_enable_topic"
+        ),
+        "guided_status_topic": LaunchConfiguration("guided_status_topic"),
+        "fcu_state_topic": LaunchConfiguration("fcu_state_topic"),
+        "set_mode_service": LaunchConfiguration("set_mode_service"),
+        "vision_mode_name": LaunchConfiguration("vision_mode_name"),
         "homing_direction_topic": LaunchConfiguration("homing_direction_topic"),
         "emergency_stop_topic": LaunchConfiguration("emergency_stop_topic"),
         "enable_keyboard_emergency_stop": ParameterValue(
@@ -193,6 +226,10 @@ def generate_launch_description():
         "vision_near_zone_width_m",
         "target_depth_z_m",
         "odometry_timeout_s",
+        "fcu_state_timeout_s",
+        "handoff_hold_sec",
+        "handoff_max_speed_mps",
+        "mode_request_interval_s",
         "rate_hz",
     ]:
         controller_parameters[name] = ParameterValue(values[name], value_type=float)

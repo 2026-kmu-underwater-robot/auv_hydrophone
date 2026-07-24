@@ -40,6 +40,7 @@ add_library(${PROJECT_NAME} SHARED
 # 3. 단축키(ament_target_dependencies) 대신 수동으로 헤더 파일 경로를 지정합니다.
 target_include_directories(${PROJECT_NAME}
   PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${rclcpp_INCLUDE_DIRS}
     ${rclcpp_components_INCLUDE_DIRS}
     ${std_msgs_INCLUDE_DIRS}

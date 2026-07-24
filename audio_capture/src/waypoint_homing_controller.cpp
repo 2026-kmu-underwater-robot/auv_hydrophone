@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -15,10 +16,14 @@
 #include <termios.h>
 #include <unistd.h>
 
+#include <audio_capture/arena_frame_transform.hpp>
 #include <Eigen/Dense>
 #include <geometry_msgs/msg/point_stamped.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/vector3_stamped.hpp>
 #include <mavros_msgs/msg/position_target.hpp>
+#include <mavros_msgs/msg/state.hpp>
+#include <mavros_msgs/srv/set_mode.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_components/register_node_macro.hpp>
@@ -47,6 +52,8 @@ public:
             "state_topic", "/homing/control_state");
         const auto waypoint_topic = declare_parameter<std::string>(
             "waypoint_topic", "/waypoint");
+        const auto arena_start_frame_topic = declare_parameter<std::string>(
+            "arena_start_frame_topic", "/guided/start_frame");
         const auto scan_center_topic = declare_parameter<std::string>(
             "scan_center_topic", "/homing/scan_center");
         const auto vision_search_request_topic = declare_parameter<std::string>(
@@ -56,6 +63,20 @@ public:
         // [ACOUSTIC-VISION HANDSHAKE] Vision은 이 승인 후에만 제어를 시작한다.
         const auto vision_control_granted_topic = declare_parameter<std::string>(
             "vision_control_granted_topic", "/homing/vision_control_granted");
+        const auto guided_waypoint_enable_topic =
+            declare_parameter<std::string>(
+                "guided_waypoint_enable_topic", "/guided/waypoint_enable");
+        const auto guided_status_topic = declare_parameter<std::string>(
+            "guided_status_topic", "/guided/status");
+        const auto fcu_state_topic = declare_parameter<std::string>(
+            "fcu_state_topic", "/mavros/state");
+        const auto set_mode_service = declare_parameter<std::string>(
+            "set_mode_service", "/mavros/set_mode");
+        vision_mode_name_ = declare_parameter<std::string>(
+            "vision_mode_name", "STABILIZE");
+        if (vision_mode_name_.empty()) {
+            throw std::invalid_argument("vision_mode_name must not be empty");
+        }
         const auto emergency_stop_topic = declare_parameter<std::string>(
             "emergency_stop_topic", "/mission/emergency_stop");
         const bool enable_keyboard_emergency_stop = declare_parameter<bool>(
@@ -128,11 +149,26 @@ public:
             declare_parameter<double>("rate_hz", 30.0), 1.0, 120.0);
         odometry_timeout_s_ = std::max(
             0.05, declare_parameter<double>("odometry_timeout_s", 0.5));
+        fcu_state_timeout_s_ = std::max(
+            0.05, declare_parameter<double>("fcu_state_timeout_s", 1.0));
+        handoff_hold_sec_ = std::max(
+            0.0, declare_parameter<double>("handoff_hold_sec", 0.7));
+        handoff_max_speed_mps_ = std::max(
+            0.0, declare_parameter<double>("handoff_max_speed_mps", 0.2));
+        mode_request_interval_s_ = std::max(
+            0.1, declare_parameter<double>("mode_request_interval_s", 1.0));
 
         odometry_sub_ = create_subscription<nav_msgs::msg::Odometry>(
             odometry_topic, 30,
             std::bind(&WaypointHomingControllerNode::odometry_callback, this,
                 std::placeholders::_1));
+        arena_start_frame_sub_ =
+            create_subscription<geometry_msgs::msg::PoseStamped>(
+                arena_start_frame_topic,
+                rclcpp::QoS(1).reliable().transient_local(),
+                std::bind(
+                    &WaypointHomingControllerNode::arena_start_frame_callback,
+                    this, std::placeholders::_1));
         region_gradient_sub_ = create_subscription<geometry_msgs::msg::Vector3Stamped>(
             region_gradient_topic, 10,
             std::bind(&WaypointHomingControllerNode::region_gradient_callback, this,
@@ -147,6 +183,15 @@ public:
             rclcpp::QoS(1).reliable().transient_local(),
             std::bind(&WaypointHomingControllerNode::target_confirmed_callback, this,
                 std::placeholders::_1));
+        guided_status_sub_ = create_subscription<std_msgs::msg::String>(
+            guided_status_topic,
+            rclcpp::QoS(1).reliable().transient_local(),
+            std::bind(&WaypointHomingControllerNode::guided_status_callback, this,
+                std::placeholders::_1));
+        fcu_state_sub_ = create_subscription<mavros_msgs::msg::State>(
+            fcu_state_topic, rclcpp::QoS(10).reliable(),
+            std::bind(&WaypointHomingControllerNode::fcu_state_callback, this,
+                std::placeholders::_1));
         state_pub_ = create_publisher<std_msgs::msg::String>(
             state_topic, rclcpp::QoS(1).reliable().transient_local());
         waypoint_pub_ = create_publisher<mavros_msgs::msg::PositionTarget>(
@@ -159,6 +204,10 @@ public:
         vision_control_granted_pub_ = create_publisher<std_msgs::msg::Bool>(
             vision_control_granted_topic,
             rclcpp::QoS(1).reliable().transient_local());
+        guided_waypoint_enable_pub_ = create_publisher<std_msgs::msg::Bool>(
+            guided_waypoint_enable_topic, rclcpp::QoS(10).reliable());
+        set_mode_client_ = create_client<mavros_msgs::srv::SetMode>(
+            set_mode_service);
         homing_direction_pub_ =
             create_publisher<geometry_msgs::msg::Vector3Stamped>(
                 homing_direction_topic,
@@ -213,6 +262,7 @@ private:
         REGION_SCAN,    //원형 탐색 상태
         REGION_HOMING,    //원형 탐색 결과 그래디언트 매칭 상태
         WAIT_VISION_TARGET,    // [ACOUSTIC-VISION HANDSHAKE] 경계에서 Vision 확정을 기다린다.
+        HANDOFF_PREPARE,      // 외부 waypoint 제어를 해제하고 비전용 모드를 확인한다.
         HANDOFF_COMPLETE       // [ACOUSTIC-VISION HANDSHAKE] Acoustic waypoint 생성을 종료한다.
     };
 
@@ -244,19 +294,67 @@ private:
         const Eigen::Vector2d position(
             msg->pose.pose.position.x, msg->pose.pose.position.y);
         const double z_m = msg->pose.pose.position.z;
-        if (!position.allFinite() || !std::isfinite(z_m)) {
+        const auto & linear_velocity = msg->twist.twist.linear;
+        const double speed_mps = std::sqrt(
+            linear_velocity.x * linear_velocity.x +
+            linear_velocity.y * linear_velocity.y +
+            linear_velocity.z * linear_velocity.z);
+        if (!position.allFinite() || !std::isfinite(z_m) ||
+            !std::isfinite(speed_mps))
+        {
             return;
         }
-        const bool first_odometry = !have_odometry_;
         current_position_ = position; // 현재 위치를 업데이트한다.
         current_z_m_ = z_m;
+        current_speed_mps_ = speed_mps;
         odometry_frame_ = msg->header.frame_id.empty() ? "odom" : msg->header.frame_id; // 오돔 메세지가 어느 좌표계 기준인지 업데이트한다 (빈 문자열이면 odom 기준).
         last_odometry_receive_time_ = now(); // 마지막 오도메트리 수신 시간을 업데이트한다.
         have_odometry_ = true; // 오도메트리 수신 여부를 업데이트한다.
 
-        if (first_odometry) { // 최초 odometry 수신 시 미션을 시작한다.
-            start_new_region_scan(arena_center(), true); // 최초 탐색은 실험장 중앙에서 시작.
+        try_start_mission();
+    }
+
+    void arena_start_frame_callback(
+        const geometry_msgs::msg::PoseStamped::ConstSharedPtr msg)
+    {
+        if (mission_started_) {
+            RCLCPP_WARN(
+                get_logger(),
+                "[ARENA] ignored start-frame update after acoustic mission start");
+            return;
         }
+        std::string error;
+        if (!arena_frame_.update(*msg, error)) {
+            RCLCPP_WARN(
+                get_logger(), "[ARENA] invalid start frame: %s", error.c_str());
+            return;
+        }
+        RCLCPP_INFO(
+            get_logger(),
+            "[ARENA] start frame received: parent=%s origin=(%.3f, %.3f) "
+            "yaw=%.2f deg",
+            arena_frame_.parent_frame().c_str(),
+            arena_frame_.origin().x(), arena_frame_.origin().y(),
+            arena_frame_.yaw_rad() * 180.0 / PI);
+        try_start_mission();
+    }
+
+    void try_start_mission()
+    {
+        if (mission_started_ || !have_odometry_ || !arena_frame_.ready()) {
+            return;
+        }
+        if (arena_frame_.parent_frame() !=
+            ArenaFrameTransform2D::normalized_frame(odometry_frame_))
+        {
+            RCLCPP_ERROR_THROTTLE(
+                get_logger(), *get_clock(), 2000,
+                "[ARENA] start-frame parent '%s' does not match odometry frame '%s'",
+                arena_frame_.parent_frame().c_str(), odometry_frame_.c_str());
+            return;
+        }
+        mission_started_ = true;
+        start_new_region_scan(arena_center(), true);
     }
 
 
@@ -338,25 +436,53 @@ private:
             return;
         }
         set_current_waypoint(current_position_);
-        transition_to(State::HANDOFF_COMPLETE);
-        publish_vision_control_granted(true);
+        handoff_stable_since_.reset();
+        guided_disable_sent_ = false;
+        guided_controller_idle_ = false;
+        mode_request_pending_ = false;
+        publish_vision_control_granted(false);
+        transition_to(State::HANDOFF_PREPARE);
         RCLCPP_INFO(
             get_logger(),
-            "[VISION] target confirmed; hold waypoint sent and vision control granted");
+            "[HANDOFF] target confirmed; stabilizing before releasing acoustic control");
+    }
+
+    void guided_status_callback(
+        const std_msgs::msg::String::ConstSharedPtr msg)
+    {
+        const bool was_idle = guided_controller_idle_;
+        guided_controller_idle_ = msg->data.rfind("IDLE:", 0) == 0;
+        if (!was_idle && guided_controller_idle_ &&
+            state_ == State::HANDOFF_PREPARE)
+        {
+            RCLCPP_INFO(
+                get_logger(), "[HANDOFF] external waypoint controller is IDLE");
+        }
+    }
+
+    void fcu_state_callback(
+        const mavros_msgs::msg::State::ConstSharedPtr msg)
+    {
+        have_fcu_state_ = true;
+        fcu_connected_ = msg->connected;
+        current_fcu_mode_ = msg->mode;
+        last_fcu_state_receive_time_ = now();
     }
 
     bool inside_vision_zone(const Eigen::Vector2d & position) const
     {
-        if (vision_near_zone_width_m_ <= 0.0) {
+        if (vision_near_zone_width_m_ <= 0.0 || !arena_frame_.ready()) {
             return false;
         }
+        const Eigen::Vector2d arena_position =
+            arena_frame_.odom_to_arena(position);
         const ArenaBounds bounds = arena_bounds(arena_safety_margin_m_);
         const double width = std::min(
             vision_near_zone_width_m_, bounds.y_max - bounds.y_min);
         if (arena_start_corner_ == "bottom_left") {
-            return position.y() <= bounds.y_min + width;
+            return arena_position.y() <= bounds.y_min + width;
         }
-        return position.y() >= bounds.y_max - width;
+        return arena_position.y() >= bounds.y_max - width;
     }
 
     bool inside_vision_zone() const
@@ -424,6 +550,12 @@ private:
             log_controller_status();
             return;
         }
+        if (!mission_started_) {
+            RCLCPP_INFO_THROTTLE(
+                get_logger(), *get_clock(), 2000,
+                "[ARENA] waiting for odometry and /guided/start_frame");
+            return;
+        }
         if (!odometry_is_fresh(current_time)) {
             return;
         }
@@ -478,10 +610,121 @@ private:
                 handle_homing_waypoint_result(make_next_homing_waypoint());
                 return;
 
+            case State::HANDOFF_PREPARE:
+                run_handoff_prepare(current_time);
+                return;
+
             case State::WAIT_VISION_TARGET:
             case State::HANDOFF_COMPLETE:
                 return;
         }
+    }
+
+    void run_handoff_prepare(const rclcpp::Time & current_time)
+    {
+        if (!guided_disable_sent_) {
+            const bool stable =
+                waypoint_reached() && depth_target_reached() &&
+                current_speed_mps_ <= handoff_max_speed_mps_;
+            if (!stable) {
+                handoff_stable_since_.reset();
+                RCLCPP_INFO_THROTTLE(
+                    get_logger(), *get_clock(), 1000,
+                    "[HANDOFF] holding position: distance=%.2f m speed=%.2f m/s",
+                    (current_waypoint_ - current_position_).norm(),
+                    current_speed_mps_);
+                return;
+            }
+            if (!handoff_stable_since_) {
+                handoff_stable_since_ = current_time;
+                return;
+            }
+            if ((current_time - *handoff_stable_since_).seconds() <
+                handoff_hold_sec_)
+            {
+                return;
+            }
+            if (!fcu_state_is_fresh(current_time) || !fcu_connected_ ||
+                !set_mode_client_->service_is_ready())
+            {
+                RCLCPP_WARN_THROTTLE(
+                    get_logger(), *get_clock(), 2000,
+                    "[HANDOFF] waiting for a connected FCU and set-mode service");
+                return;
+            }
+
+            publish_guided_waypoint_enabled(false);
+            guided_disable_sent_ = true;
+            RCLCPP_INFO(
+                get_logger(),
+                "[HANDOFF] external waypoint control disable requested");
+            return;
+        }
+
+        if (!guided_controller_idle_) {
+            RCLCPP_WARN_THROTTLE(
+                get_logger(), *get_clock(), 2000,
+                "[HANDOFF] waiting for /guided/status IDLE confirmation");
+            return;
+        }
+
+        if (fcu_state_is_fresh(current_time) && fcu_connected_ &&
+            current_fcu_mode_ == vision_mode_name_)
+        {
+            publish_vision_control_granted(true);
+            transition_to(State::HANDOFF_COMPLETE);
+            RCLCPP_INFO(
+                get_logger(),
+                "[HANDOFF] FCU mode %s confirmed; vision control granted",
+                vision_mode_name_.c_str());
+            return;
+        }
+        request_vision_mode(current_time);
+    }
+
+    void request_vision_mode(const rclcpp::Time & current_time)
+    {
+        if (!fcu_state_is_fresh(current_time) || !fcu_connected_) {
+            RCLCPP_WARN_THROTTLE(
+                get_logger(), *get_clock(), 2000,
+                "[HANDOFF] waiting for fresh connected FCU state");
+            return;
+        }
+        if (mode_request_pending_ || !set_mode_client_->service_is_ready()) {
+            RCLCPP_WARN_THROTTLE(
+                get_logger(), *get_clock(), 2000,
+                "[HANDOFF] waiting for set-mode service");
+            return;
+        }
+
+        const auto steady_now = std::chrono::steady_clock::now();
+        if (last_mode_request_time_.time_since_epoch().count() != 0 &&
+            std::chrono::duration<double>(
+                steady_now - last_mode_request_time_).count() <
+            mode_request_interval_s_)
+        {
+            return;
+        }
+
+        auto request = std::make_shared<mavros_msgs::srv::SetMode::Request>();
+        request->base_mode = 0;
+        request->custom_mode = vision_mode_name_;
+        mode_request_pending_ = true;
+        last_mode_request_time_ = steady_now;
+        set_mode_client_->async_send_request(
+            request,
+            [this](rclcpp::Client<mavros_msgs::srv::SetMode>::SharedFuture future) {
+                mode_request_pending_ = false;
+                if (!future.get()->mode_sent) {
+                    RCLCPP_WARN(
+                        get_logger(),
+                        "[HANDOFF] FCU rejected mode request for %s",
+                        vision_mode_name_.c_str());
+                }
+            });
+        RCLCPP_INFO(
+            get_logger(), "[HANDOFF] requested FCU mode %s",
+            vision_mode_name_.c_str());
     }
 
     void start_new_region_scan(const Eigen::Vector2d & requested_center, const bool force = false)
@@ -672,29 +915,37 @@ private:
     Eigen::Vector2d adjusted_scan_center(
         const Eigen::Vector2d & position, const double radius) const // 원형 탐색 중심 위치를 실험장 안쪽으로 조정하는 함수
     {
-        Eigen::Vector2d center = position;
+        Eigen::Vector2d center = arena_frame_.odom_to_arena(position);
         const double inset = arena_safety_margin_m_ + radius; // 중심이 벽에서 최소 이만큼 떨어져야 반경 원이 여유공간을 안 뚫음
         const ArenaBounds bounds = arena_bounds(inset);
         center.x() = std::clamp(center.x(), bounds.x_min, bounds.x_max);
         center.y() = std::clamp(center.y(), bounds.y_min, bounds.y_max);
-        return center; //보정된 중심 위치를 반환.
+        return arena_frame_.arena_to_odom(center); //보정된 중심 위치를 반환.
     }
 
     Eigen::Vector2d arena_center() const
     {
         const ArenaBounds bounds = arena_bounds(0.0);
-        return {
+        return arena_frame_.arena_to_odom({
             0.5 * (bounds.x_min + bounds.x_max),
-            0.5 * (bounds.y_min + bounds.y_max)};
+            0.5 * (bounds.y_min + bounds.y_max)});
     }
 
 
     // 원형 탐색 경로가 실험장 안쪽에 있는지 판정하는 함수
     bool waypoint_is_safe(const Eigen::Vector2d & waypoint) const
     {
+        if (!arena_frame_.ready()) {
+            return false;
+        }
+        const Eigen::Vector2d arena_waypoint =
+            arena_frame_.odom_to_arena(waypoint);
         const ArenaBounds bounds = arena_bounds(arena_safety_margin_m_);
-        return waypoint.x() >= bounds.x_min && waypoint.x() <= bounds.x_max &&
-            waypoint.y() >= bounds.y_min && waypoint.y() <= bounds.y_max;
+        return
+            arena_waypoint.x() >= bounds.x_min &&
+            arena_waypoint.x() <= bounds.x_max &&
+            arena_waypoint.y() >= bounds.y_min &&
+            arena_waypoint.y() <= bounds.y_max;
     }
 
     ArenaBounds arena_bounds(const double inset) const
@@ -786,6 +1037,13 @@ private:
         vision_control_granted_pub_->publish(msg);
     }
 
+    void publish_guided_waypoint_enabled(const bool enabled)
+    {
+        std_msgs::msg::Bool msg;
+        msg.data = enabled;
+        guided_waypoint_enable_pub_->publish(msg);
+    }
+
     void publish_homing_direction()
     {
         geometry_msgs::msg::Vector3Stamped msg;
@@ -867,6 +1125,13 @@ private:
             (current_time - last_odometry_receive_time_).seconds() <= odometry_timeout_s_;
     }
 
+    bool fcu_state_is_fresh(const rclcpp::Time & current_time) const
+    {
+        return have_fcu_state_ &&
+            (current_time - last_fcu_state_receive_time_).seconds() <=
+            fcu_state_timeout_s_;
+    }
+
     static double wrap_pi(const double angle)
     {
         return std::atan2(std::sin(angle), std::cos(angle));
@@ -885,6 +1150,8 @@ private:
                 return "REGION_HOMING";
             case State::WAIT_VISION_TARGET:
                 return "WAIT_VISION_TARGET";
+            case State::HANDOFF_PREPARE:
+                return "HANDOFF_PREPARE";
             case State::HANDOFF_COMPLETE:
                 return "HANDOFF_COMPLETE";
         }
@@ -909,11 +1176,16 @@ private:
     double target_depth_z_m_ = -0.65;
     double rate_hz_ = 30.0;
     double odometry_timeout_s_ = 0.5;
+    double fcu_state_timeout_s_ = 1.0;
+    double handoff_hold_sec_ = 0.7;
+    double handoff_max_speed_mps_ = 0.2;
+    double mode_request_interval_s_ = 1.0;
     std::size_t rolling_gradient_conflict_limit_ = 3;
     std::size_t rolling_gradient_conflict_count_ = 0;
     double zigzag_sign_ = 1.0;
     std::string arena_start_corner_ = "bottom_left";
     std::string odometry_frame_ = "odom";
+    std::string vision_mode_name_ = "STABILIZE";
     bool vision_handoff_enabled_ = true;
     bool have_odometry_ = false;
     bool rescan_requested_ = false;
@@ -921,11 +1193,19 @@ private:
     bool first_region_scan_ = true;
     bool emergency_hold_published_ = false;
     bool have_current_waypoint_ = false;
+    bool mission_started_ = false;
+    bool guided_controller_idle_ = false;
+    bool guided_disable_sent_ = false;
+    bool have_fcu_state_ = false;
+    bool fcu_connected_ = false;
+    bool mode_request_pending_ = false;
     std::string emergency_stop_key_ = "s";
     State state_ = State::MOVE_TO_SCAN_CENTER;
     RegionResultState region_result_state_ = RegionResultState::WAITING;
     rclcpp::Time last_odometry_receive_time_;
+    rclcpp::Time last_fcu_state_receive_time_;
     double current_z_m_ = 0.0;
+    double current_speed_mps_ = 0.0;
     double previous_scan_angle_rad_ = 0.0;
     double accumulated_scan_angle_rad_ = 0.0;
     Eigen::Vector2d current_position_{0.0, 0.0};
@@ -935,22 +1215,33 @@ private:
     Eigen::Vector2d region_gradient_{1.0, 0.0};
     Eigen::Vector2d homing_direction_{1.0, 0.0};
     std::vector<Eigen::Vector2d> waypoints_;
+    std::optional<rclcpp::Time> handoff_stable_since_;
+    std::chrono::steady_clock::time_point last_mode_request_time_;
+    std::string current_fcu_mode_;
+    ArenaFrameTransform2D arena_frame_;
 
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odometry_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr
+        arena_start_frame_sub_;
     rclcpp::Subscription<geometry_msgs::msg::Vector3Stamped>::SharedPtr
         region_gradient_sub_;
     rclcpp::Subscription<geometry_msgs::msg::Vector3Stamped>::SharedPtr
         rolling_gradient_sub_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr target_confirmed_sub_;
+    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr guided_status_sub_;
+    rclcpp::Subscription<mavros_msgs::msg::State>::SharedPtr fcu_state_sub_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr emergency_stop_sub_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr state_pub_;
     rclcpp::Publisher<mavros_msgs::msg::PositionTarget>::SharedPtr waypoint_pub_;
     rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr scan_center_pub_;
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr vision_search_request_pub_;
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr vision_control_granted_pub_;
+    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr
+        guided_waypoint_enable_pub_;
     rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr
         homing_direction_pub_;
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr emergency_stop_pub_;
+    rclcpp::Client<mavros_msgs::srv::SetMode>::SharedPtr set_mode_client_;
     rclcpp::TimerBase::SharedPtr timer_;
     std::atomic_bool emergency_stop_active_{false};
     std::atomic_bool stop_keyboard_thread_{false};

@@ -11,10 +11,16 @@ def generate_launch_description():
         ("snr_topic", "/audio_frequency_detector/snr_db_stamped"),
         ("state_topic", "/homing/control_state"),
         ("waypoint_topic", "/waypoint"),  # odom 절대좌표 PositionTarget
+        ("arena_start_frame_topic", "/guided/start_frame"),
         ("peak_topic", "/homing/snr_peak_position"),
         ("vision_search_request_topic", "/homing/vision_search_active"),
         ("target_confirmed_topic", "/vision/target_confirmed"),
         ("vision_control_granted_topic", "/homing/vision_control_granted"),
+        ("guided_waypoint_enable_topic", "/guided/waypoint_enable"),
+        ("guided_status_topic", "/guided/status"),
+        ("fcu_state_topic", "/mavros/state"),
+        ("set_mode_service", "/mavros/set_mode"),
+        ("vision_mode_name", "STABILIZE"),
         ("emergency_stop_topic", "/mission/emergency_stop"),
         ("emergency_stop_key", "s"),
         ("arena_start_corner", "bottom_left"),
@@ -33,6 +39,10 @@ def generate_launch_description():
         ("snr_timeout_s", "1.0"),
         ("max_snr_odom_skew_s", "0.15"),
         ("odometry_timeout_s", "0.5"),
+        ("fcu_state_timeout_s", "1.0"),
+        ("handoff_hold_sec", "0.7"),
+        ("handoff_max_speed_mps", "0.2"),
+        ("mode_request_interval_s", "1.0"),
         ("rate_hz", "30.0"),
     ]
     int_names = [

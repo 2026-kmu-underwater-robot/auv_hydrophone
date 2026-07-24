@@ -149,6 +149,9 @@ def generate_launch_description():
         DeclareLaunchArgument("attenuation_power", default_value="2.0"),
         DeclareLaunchArgument("sound_speed_mps", default_value="1500.0"),
         DeclareLaunchArgument("arena_start_corner", default_value="bottom_left"),
+        DeclareLaunchArgument(
+            "arena_start_frame_topic", default_value="/guided/start_frame"
+        ),
         DeclareLaunchArgument("vision_handoff_enabled", default_value="true"),
         DeclareLaunchArgument(
             "vision_search_request_topic",
@@ -231,6 +234,10 @@ def generate_launch_description():
                 "use_sim_time": ParameterValue(use_sim_time, value_type=bool),
                 "input_topic": raw_odometry_topic,
                 "output_topic": homing_odometry_topic,
+                "start_frame_input_topic": LaunchConfiguration(
+                    "arena_start_frame_topic"
+                ),
+                "start_frame_output_topic": "/homing/sim_start_frame",
                 "arena_yaw_rad": ParameterValue(
                     sim_arena_yaw_rad, value_type=float
                 ),
@@ -249,6 +256,7 @@ def generate_launch_description():
         launch_arguments={
             "use_sim_time": use_sim_time,
             "odometry_topic": homing_odometry_topic,
+            "arena_start_frame_topic": "/homing/sim_start_frame",
             "arena_start_corner": LaunchConfiguration("arena_start_corner"),
             "vision_handoff_enabled": LaunchConfiguration(
                 "vision_handoff_enabled"
@@ -301,6 +309,7 @@ def generate_launch_description():
         launch_arguments={
             "use_sim_time": use_sim_time,
             "odometry_topic": homing_odometry_topic,
+            "arena_start_frame_topic": "/homing/sim_start_frame",
             "arena_start_corner": LaunchConfiguration("arena_start_corner"),
             "arena_length_m": LaunchConfiguration("arena_length_m"),
             "arena_width_m": LaunchConfiguration("arena_width_m"),
