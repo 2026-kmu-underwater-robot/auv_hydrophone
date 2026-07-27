@@ -1,0 +1,71 @@
+cmake_minimum_required(VERSION 3.10)
+project(hydrophone_ctrl)
+
+find_package(ament_cmake REQUIRED)
+find_package(audio_common_msgs REQUIRED)
+find_package(Eigen3 REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(mavros_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(rclcpp_components REQUIRED)
+find_package(std_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)
+
+add_library(${PROJECT_NAME} SHARED
+  src/near_zone_line_search_controller.cpp
+  src/region_local_gradient_estimator.cpp
+  src/region_local_gradient_rviz_visualizer.cpp
+  src/waypoint_homing_controller.cpp
+)
+
+target_include_directories(${PROJECT_NAME} PRIVATE ${EIGEN3_INCLUDE_DIRS})
+ament_target_dependencies(${PROJECT_NAME}
+  audio_common_msgs
+  geometry_msgs
+  mavros_msgs
+  nav_msgs
+  rclcpp
+  rclcpp_components
+  std_msgs
+  visualization_msgs
+)
+
+rclcpp_components_register_node(
+  ${PROJECT_NAME}
+  PLUGIN "audio_capture::RegionLocalGradientEstimatorNode"
+  EXECUTABLE region_local_gradient_estimator
+)
+rclcpp_components_register_node(
+  ${PROJECT_NAME}
+  PLUGIN "audio_capture::WaypointHomingControllerNode"
+  EXECUTABLE waypoint_homing_controller
+)
+rclcpp_components_register_node(
+  ${PROJECT_NAME}
+  PLUGIN "audio_capture::NearZoneLineSearchControllerNode"
+  EXECUTABLE near_zone_line_search_controller
+)
+rclcpp_components_register_node(
+  ${PROJECT_NAME}
+  PLUGIN "audio_capture::RegionLocalGradientRvizVisualizerNode"
+  EXECUTABLE region_local_gradient_rviz_visualizer
+)
+
+install(
+  TARGETS
+    ${PROJECT_NAME}
+    region_local_gradient_estimator
+    waypoint_homing_controller
+    near_zone_line_search_controller
+    region_local_gradient_rviz_visualizer
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION lib/${PROJECT_NAME}
+)
+
+install(DIRECTORY launch rviz
+  DESTINATION share/${PROJECT_NAME}
+)
+
+ament_package()
