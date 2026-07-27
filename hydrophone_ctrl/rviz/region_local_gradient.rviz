@@ -25,7 +25,7 @@ Visualization Manager:
         Value: /homing/rviz/markers
   Global Options:
     Background Color: 24; 24; 24
-    Fixed Frame: odom
+    Fixed Frame: arena
     Frame Rate: 30
   Name: root
   Tools:

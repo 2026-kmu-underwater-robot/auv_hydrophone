@@ -7,13 +7,13 @@ from launch_ros.parameter_descriptions import ParameterValue
 
 
 # 실험 수조버전 런치
-# ros2 launch audio_capture region_local_gradient_homing.launch.py \
+# ros2 launch hydrophone_ctrl region_local_gradient_homing.launch.py \
 #   use_sim_time:=false \
 #   arena_start_corner:=bottom_left \
 #   arena_length_m:=5.49 \
 #   arena_width_m:=2.74 \
 #   arena_offset_x_m:=-0.30 \
-#   arena_offset_y_m:=0.30 \ (bottom_left면 양수로, bottom_right면 음수로)
+#   arena_offset_y_m:=0.30 \ (bottom_left=-Y, bottom_right=+Y)
 #   arena_safety_margin_m:=0.30 \
 #   initial_scan_radius_m:=1.00 \
 #   rescan_radius_m:=0.50 \
@@ -26,6 +26,7 @@ from launch_ros.parameter_descriptions import ParameterValue
 def generate_launch_description():
     use_sim_time = LaunchConfiguration("use_sim_time")  # 시뮬 시계
     odometry_topic = LaunchConfiguration("odometry_topic")  # odometry 입력
+    start_frame_topic = LaunchConfiguration("start_frame_topic")
     snr_topic = LaunchConfiguration("snr_topic")  # SNR 입력
     state_topic = LaunchConfiguration("state_topic")  # 제어 상태
     waypoint_topic = LaunchConfiguration("waypoint_topic")  # 현재 waypoint
@@ -37,8 +38,8 @@ def generate_launch_description():
     float_names = [
         ("arena_length_m", "15.0"),  # 수조 길이
         ("arena_width_m", "16.0"),  # 수조 너비
-        ("arena_offset_x_m", "0.0"),  # 수조 원점 X 오프셋
-        ("arena_offset_y_m", "0.0"),  # 수조 원점 Y 오프셋
+        ("arena_offset_x_m", "0.0"),  # 시작 좌표계 기준 수조 경계 X 오프셋
+        ("arena_offset_y_m", "0.0"),  # 시작 좌표계 기준 수조 경계 Y 오프셋
         ("arena_safety_margin_m", "0.5"),  # 벽으로부터의 안전 여유
         ("initial_scan_radius_m", "1.5"),  # 최초 원형 스캔 반경
         ("rescan_radius_m", "0.7"),  # 재스캔 원형 반경
@@ -56,6 +57,7 @@ def generate_launch_description():
         ("min_region_lateral_spread_m", "0.10"),  # 유효 피팅용 최소 횡방향 퍼짐
         ("vision_near_zone_width_m", "2.0"),  # 비전 인계용 근접 구간 폭
         ("target_depth_z_m", "-0.65"),  # 목표 수심 (odom z)
+        ("depth_tolerance_m", "0.10"),  # 목표 수심 도달 허용오차
         ("odometry_timeout_s", "0.5"),  # odometry 신선도 타임아웃
         ("max_snr_odom_skew_s", "0.15"),  # SNR-odometry 시각 허용 오차
         ("forward_cruise", "0.5"),  # 정렬 후 전진 RC 명령 크기
@@ -81,6 +83,12 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "odometry_topic", default_value="/odometry/filtered"
         ),  # 입력 odometry 토픽
+        DeclareLaunchArgument(
+            "start_frame_topic", default_value="/guided/start_frame"
+        ),
+        DeclareLaunchArgument(
+            "arena_frame_id", default_value="arena"
+        ),
         DeclareLaunchArgument(
             "snr_topic", default_value="/audio_frequency_detector/snr_db_stamped"
         ),  # 입력 SNR 토픽
@@ -145,9 +153,11 @@ def generate_launch_description():
     common_topics = {
         "use_sim_time": ParameterValue(use_sim_time, value_type=bool),
         "odometry_topic": odometry_topic,
+        "start_frame_topic": start_frame_topic,
         "state_topic": state_topic,
         "region_gradient_topic": region_gradient_topic,
         "rolling_gradient_topic": rolling_gradient_topic,
+        "arena_frame_id": LaunchConfiguration("arena_frame_id"),
     }
     estimator_parameters = {
         **common_topics,
@@ -219,6 +229,7 @@ def generate_launch_description():
         "scan_radial_integral_limit",
         "vision_near_zone_width_m",
         "target_depth_z_m",
+        "depth_tolerance_m",
         "odometry_timeout_s",
         "forward_cruise",
         "yaw_kp",

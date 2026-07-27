@@ -12,7 +12,18 @@ Recovered source blobs:
 - `region_local_gradient_rviz_visualizer.cpp`: `aab9e56af4ce9676dece8cb95ff19705a6b8ae91`
 - `waypoint_homing_controller.cpp`: `0af3fc9f4b3541237bc126527f23acc37c91a933`
 
-The recovered C++ source files are preserved byte-for-byte. Launch files only
-change package references where required to run the recovered nodes from
-`hydrophone_ctrl`; simulation and audio nodes remain supplied by
+The recovered C++ source files were first verified byte-for-byte against these
+blobs and built successfully. They were then updated to use the agreed arena
+start frame:
+
+`p_start = R(-yaw_start_in_odom) * (p_odom - origin_start_in_odom)`
+
+The start origin and yaw come from the external transient-local
+`/guided/start_frame` (`geometry_msgs/msg/PoseStamped`) message. The hydrophone
+nodes do not capture their own yaw. Horizontal position, SNR sample positions,
+gradients, waypoints, and RViz markers use the start frame. Controller yaw is
+`yaw_start = wrap(yaw_odom - yaw_start_in_odom)`, so it is zero only at the
+captured initial heading. `arena_offset` locates the pool boundary in the start
+frame; it is not added to the odometry transform. Depth remains the original
+odometry z value. Simulation and audio nodes remain supplied by
 `audio_capture`.

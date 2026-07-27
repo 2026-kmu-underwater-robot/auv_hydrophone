@@ -1,5 +1,6 @@
 #include <cmath>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <string>
 
@@ -29,9 +30,6 @@ public:
         const auto start_frame_output_topic = declare_parameter<std::string>(
             "start_frame_output_topic", "/homing/sim_start_frame");
         output_frame_ = declare_parameter<std::string>("output_frame", "odom");
-        arena_yaw_rad_ = declare_parameter<double>(
-            "arena_yaw_rad", 3.14159265358979323846);
-
         odometry_sub_ = create_subscription<nav_msgs::msg::Odometry>(
             input_topic, 30,
             std::bind(&SimOdometryRebaserNode::odometry_callback, this,
@@ -59,11 +57,19 @@ private:
         }
         if (!have_origin_) {
             origin_ = position;
+            initial_raw_yaw_rad_ = yaw_from_quaternion(
+                msg->pose.pose.orientation);
+            if (!std::isfinite(initial_raw_yaw_rad_)) {
+                return;
+            }
             have_origin_ = true;
             if (pending_start_frame_) {
-                publish_rebased_start_frame(*pending_start_frame_);
+                configure_start_frame(*pending_start_frame_);
                 pending_start_frame_.reset();
             }
+        }
+        if (!start_frame_ready_) {
+            return;
         }
 
         const Eigen::Vector2d arena_position = rebase_position(position);
@@ -72,9 +78,8 @@ private:
         output.header.frame_id = output_frame_;
         output.pose.pose.position.x = arena_position.x();
         output.pose.pose.position.y = arena_position.y();
-
         output.pose.pose.orientation =
-            rebase_orientation(msg->pose.pose.orientation);
+            rotate_orientation(msg->pose.pose.orientation);
         odometry_pub_->publish(output);
     }
 
@@ -85,37 +90,46 @@ private:
             pending_start_frame_ = *msg;
             return;
         }
-        publish_rebased_start_frame(*msg);
+        configure_start_frame(*msg);
     }
 
-    void publish_rebased_start_frame(
+    void configure_start_frame(
         const geometry_msgs::msg::PoseStamped & input)
     {
+        const double absolute_start_yaw_rad =
+            yaw_from_quaternion(input.pose.orientation);
+        if (!std::isfinite(absolute_start_yaw_rad)) {
+            RCLCPP_WARN(get_logger(), "Ignoring invalid guided start frame yaw");
+            return;
+        }
+        yaw_offset_rad_ =
+            absolute_start_yaw_rad - initial_raw_yaw_rad_;
+        start_frame_ready_ = true;
+
         geometry_msgs::msg::PoseStamped output = input;
         output.header.frame_id = output_frame_;
-        const Eigen::Vector2d rebased = rebase_position(
-            {input.pose.position.x, input.pose.position.y});
-        output.pose.position.x = rebased.x();
-        output.pose.position.y = rebased.y();
-        output.pose.orientation = rebase_orientation(input.pose.orientation);
         start_frame_pub_->publish(output);
+        RCLCPP_INFO(
+            get_logger(),
+            "Simulation odom aligned: raw initial yaw=%.3f rad, "
+            "absolute odom yaw=%.3f rad, yaw offset=%.3f rad",
+            initial_raw_yaw_rad_, absolute_start_yaw_rad, yaw_offset_rad_);
     }
 
     Eigen::Vector2d rebase_position(const Eigen::Vector2d & position) const
     {
         const Eigen::Vector2d delta = position - origin_;
-        const double cosine = std::cos(arena_yaw_rad_);
-        const double sine = std::sin(arena_yaw_rad_);
+        const double cosine = std::cos(yaw_offset_rad_);
+        const double sine = std::sin(yaw_offset_rad_);
         return {
-            cosine * delta.x() + sine * delta.y(),
-            -sine * delta.x() + cosine * delta.y()};
+            cosine * delta.x() - sine * delta.y(),
+            sine * delta.x() + cosine * delta.y()};
     }
 
-    geometry_msgs::msg::Quaternion rebase_orientation(
+    geometry_msgs::msg::Quaternion rotate_orientation(
         const geometry_msgs::msg::Quaternion & input) const
     {
-        // world frame을 -arena_yaw만큼 회전하므로 orientation에도 같은 회전을 적용한다.
-        const double half = -0.5 * arena_yaw_rad_;
+        const double half = 0.5 * yaw_offset_rad_;
         const double rotation_w = std::cos(half);
         const double rotation_z = std::sin(half);
         geometry_msgs::msg::Quaternion output;
@@ -126,10 +140,32 @@ private:
         return output;
     }
 
-    double arena_yaw_rad_ = 3.14159265358979323846;
+    static double yaw_from_quaternion(
+        const geometry_msgs::msg::Quaternion & orientation)
+    {
+        const double norm = std::sqrt(
+            orientation.x * orientation.x +
+            orientation.y * orientation.y +
+            orientation.z * orientation.z +
+            orientation.w * orientation.w);
+        if (!std::isfinite(norm) || norm <= 1.0e-9) {
+            return std::numeric_limits<double>::quiet_NaN();
+        }
+        const double x = orientation.x / norm;
+        const double y = orientation.y / norm;
+        const double z = orientation.z / norm;
+        const double w = orientation.w / norm;
+        return std::atan2(
+            2.0 * (w * z + x * y),
+            1.0 - 2.0 * (y * y + z * z));
+    }
+
     bool have_origin_ = false;
+    bool start_frame_ready_ = false;
     std::string output_frame_ = "odom";
     Eigen::Vector2d origin_{0.0, 0.0};
+    double initial_raw_yaw_rad_ = 0.0;
+    double yaw_offset_rad_ = 0.0;
     std::optional<geometry_msgs::msg::PoseStamped> pending_start_frame_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odometry_sub_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr

@@ -19,7 +19,13 @@ add_library(${PROJECT_NAME} SHARED
   src/waypoint_homing_controller.cpp
 )
 
-target_include_directories(${PROJECT_NAME} PRIVATE ${EIGEN3_INCLUDE_DIRS})
+target_include_directories(${PROJECT_NAME}
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+  PRIVATE
+    ${EIGEN3_INCLUDE_DIRS}
+)
 ament_target_dependencies(${PROJECT_NAME}
   audio_common_msgs
   geometry_msgs
@@ -66,6 +72,9 @@ install(
 
 install(DIRECTORY launch rviz
   DESTINATION share/${PROJECT_NAME}
+)
+install(DIRECTORY include/
+  DESTINATION include
 )
 
 ament_package()

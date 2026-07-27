@@ -23,7 +23,6 @@ def generate_launch_description():
     minimum_distance_m = LaunchConfiguration("minimum_distance_m")
     attenuation_power = LaunchConfiguration("attenuation_power")
     sound_speed_mps = LaunchConfiguration("sound_speed_mps")
-    sim_arena_yaw_rad = LaunchConfiguration("sim_arena_yaw_rad")
     launch_rviz = LaunchConfiguration("launch_rviz")
     controller_mode = LaunchConfiguration("controller_mode")
 
@@ -55,8 +54,7 @@ def generate_launch_description():
         # 대회장용
         # ("arena_length_m", "15.0"),
         # ("arena_width_m", "16.0"),
-        # # 15 x 16 m 경기장의 +Y/-X 코너에서 0.55 m 안쪽인 AUV 시작점을
-        # # odom (0,0)으로 변환한 경기장 경계 오프셋.
+        # # bottom_left 시작 좌표계 (0,0) 기준 수조 경계 오프셋.
         # ("arena_offset_x_m", "-0.55"),
         # ("arena_offset_y_m", "0.55"),
         # ("arena_safety_margin_m", "0.55"),
@@ -77,6 +75,7 @@ def generate_launch_description():
         ("homing_waypoint_step_m", "0.50"),
         ("homing_zigzag_offset_m", "0.15"),
         ("target_depth_z_m", "-0.65"),
+        ("depth_tolerance_m", "0.10"),
 
         ("rolling_gradient_alpha", "0.15"),
         ("rolling_gradient_conflict_angle_rad", "1.0472"),
@@ -138,10 +137,9 @@ def generate_launch_description():
             "homing_odometry_topic", default_value="/homing/sim_odometry"
         ),
         DeclareLaunchArgument(
-            "sim_arena_yaw_rad",
-            default_value="0.0",
-            description="MuJoCo world에서 arena +X축이 향하는 yaw.",
+            "start_frame_topic", default_value="/homing/sim_start_frame"
         ),
+        DeclareLaunchArgument("arena_frame_id", default_value="arena"),
         DeclareLaunchArgument(
             "signal_mode",
             default_value="noisy",
@@ -246,8 +244,9 @@ def generate_launch_description():
                 "use_sim_time": ParameterValue(use_sim_time, value_type=bool),
                 "input_topic": raw_odometry_topic,
                 "output_topic": homing_odometry_topic,
-                "arena_yaw_rad": ParameterValue(
-                    sim_arena_yaw_rad, value_type=float
+                "start_frame_input_topic": "/guided/start_frame",
+                "start_frame_output_topic": LaunchConfiguration(
+                    "start_frame_topic"
                 ),
             }
         ],
@@ -264,6 +263,8 @@ def generate_launch_description():
         launch_arguments={
             "use_sim_time": use_sim_time,
             "odometry_topic": homing_odometry_topic,
+            "start_frame_topic": LaunchConfiguration("start_frame_topic"),
+            "arena_frame_id": LaunchConfiguration("arena_frame_id"),
             "arena_start_corner": LaunchConfiguration("arena_start_corner"),
             "invert_rc_yaw": LaunchConfiguration("invert_rc_yaw"),
             "vision_handoff_enabled": LaunchConfiguration(
@@ -317,6 +318,8 @@ def generate_launch_description():
         launch_arguments={
             "use_sim_time": use_sim_time,
             "odometry_topic": homing_odometry_topic,
+            "start_frame_topic": LaunchConfiguration("start_frame_topic"),
+            "arena_frame_id": LaunchConfiguration("arena_frame_id"),
             "arena_start_corner": LaunchConfiguration("arena_start_corner"),
             "arena_length_m": LaunchConfiguration("arena_length_m"),
             "arena_width_m": LaunchConfiguration("arena_width_m"),
@@ -393,6 +396,8 @@ def generate_launch_description():
         launch_arguments={
             "use_sim_time": use_sim_time,
             "odometry_topic": homing_odometry_topic,
+            "start_frame_topic": LaunchConfiguration("start_frame_topic"),
+            "arena_frame_id": LaunchConfiguration("arena_frame_id"),
             "arena_length_m": LaunchConfiguration("arena_length_m"),
             "arena_width_m": LaunchConfiguration("arena_width_m"),
             "arena_offset_x_m": LaunchConfiguration("arena_offset_x_m"),

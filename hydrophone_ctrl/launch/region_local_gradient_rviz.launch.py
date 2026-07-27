@@ -20,6 +20,10 @@ def generate_launch_description():
         DeclareLaunchArgument("use_sim_time", default_value="false"),
         DeclareLaunchArgument("odometry_topic", default_value="/odometry/filtered"),
         DeclareLaunchArgument(
+            "start_frame_topic", default_value="/guided/start_frame"
+        ),
+        DeclareLaunchArgument("arena_frame_id", default_value="arena"),
+        DeclareLaunchArgument(
             "snr_topic", default_value="/audio_frequency_detector/snr_db_stamped"
         ),
         DeclareLaunchArgument(
@@ -60,6 +64,8 @@ def generate_launch_description():
             {
                 "use_sim_time": ParameterValue(use_sim_time, value_type=bool),
                 "odometry_topic": LaunchConfiguration("odometry_topic"),
+                "start_frame_topic": LaunchConfiguration("start_frame_topic"),
+                "arena_frame_id": LaunchConfiguration("arena_frame_id"),
                 "snr_topic": LaunchConfiguration("snr_topic"),
                 "region_gradient_topic": LaunchConfiguration(
                     "region_gradient_topic"

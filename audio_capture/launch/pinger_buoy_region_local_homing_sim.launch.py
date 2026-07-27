@@ -23,7 +23,6 @@ def generate_launch_description():
     minimum_distance_m = LaunchConfiguration("minimum_distance_m")
     attenuation_power = LaunchConfiguration("attenuation_power")
     sound_speed_mps = LaunchConfiguration("sound_speed_mps")
-    sim_arena_yaw_rad = LaunchConfiguration("sim_arena_yaw_rad")
     launch_rviz = LaunchConfiguration("launch_rviz")
     controller_mode = LaunchConfiguration("controller_mode")
 
@@ -123,11 +122,6 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "homing_odometry_topic", default_value="/homing/sim_odometry"
-        ),
-        DeclareLaunchArgument(
-            "sim_arena_yaw_rad",
-            default_value="0.0",
-            description="MuJoCo world에서 arena +X축이 향하는 yaw.",
         ),
         DeclareLaunchArgument(
             "signal_mode",
@@ -238,9 +232,6 @@ def generate_launch_description():
                     "arena_start_frame_topic"
                 ),
                 "start_frame_output_topic": "/homing/sim_start_frame",
-                "arena_yaw_rad": ParameterValue(
-                    sim_arena_yaw_rad, value_type=float
-                ),
             }
         ],
     )

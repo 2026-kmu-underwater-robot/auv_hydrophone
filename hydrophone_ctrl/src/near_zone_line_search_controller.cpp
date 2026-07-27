@@ -20,7 +20,9 @@
 
 #include <audio_common_msgs/msg/float64_stamped.hpp>
 #include <Eigen/Dense>
+#include "hydrophone_ctrl/arena_frame_transform.hpp"
 #include <geometry_msgs/msg/point_stamped.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
 #include <mavros_msgs/msg/override_rc_in.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -41,12 +43,16 @@ public:
     {
         const auto odometry_topic = declare_parameter<std::string>(
             "odometry_topic", "/odometry/filtered");
+        const auto start_frame_topic = declare_parameter<std::string>(
+            "start_frame_topic", "/guided/start_frame");
         const auto snr_topic = declare_parameter<std::string>(
             "snr_topic", "/audio_frequency_detector/snr_db_stamped");
         const auto state_topic = declare_parameter<std::string>(
             "state_topic", "/homing/control_state");
         const auto waypoint_topic = declare_parameter<std::string>(
             "waypoint_topic", "/homing/current_waypoint");
+        arena_frame_id_ = declare_parameter<std::string>(
+            "arena_frame_id", "arena");
         const auto peak_topic = declare_parameter<std::string>(
             "peak_topic", "/homing/snr_peak_position");
         const auto vision_search_request_topic = declare_parameter<std::string>(
@@ -148,6 +154,13 @@ public:
             odometry_topic, 30,
             std::bind(&NearZoneLineSearchControllerNode::odometry_callback, this,
                 std::placeholders::_1));
+        start_frame_sub_ =
+            create_subscription<geometry_msgs::msg::PoseStamped>(
+                start_frame_topic,
+                rclcpp::QoS(1).reliable().transient_local(),
+                std::bind(
+                    &NearZoneLineSearchControllerNode::start_frame_callback,
+                    this, std::placeholders::_1));
         snr_sub_ =
             create_subscription<audio_common_msgs::msg::Float64Stamped>(
                 snr_topic, 20,
@@ -262,27 +275,60 @@ private:
         Eigen::Vector2d position{0.0, 0.0};
     };
 
+    void start_frame_callback(
+        const geometry_msgs::msg::PoseStamped::ConstSharedPtr msg)
+    {
+        if (arena_transform_.initialized()) {
+            return;
+        }
+        const Eigen::Vector2d origin(
+            msg->pose.position.x, msg->pose.position.y);
+        const double yaw = hydrophone_ctrl::ArenaFrameTransform::
+            yaw_from_quaternion(
+            msg->pose.orientation.w,
+            msg->pose.orientation.x,
+            msg->pose.orientation.y,
+            msg->pose.orientation.z);
+        if (!origin.allFinite() || !std::isfinite(yaw)) {
+            RCLCPP_WARN(get_logger(), "Ignoring invalid guided start frame");
+            return;
+        }
+        arena_transform_.initialize(origin, yaw);
+        RCLCPP_INFO(
+            get_logger(),
+            "Guided start frame accepted: origin_odom=(%.3f, %.3f), "
+            "yaw_odom=%.3f rad; arena boundary offset in start frame=(%.2f, %.2f)",
+            origin.x(), origin.y(), yaw,
+            arena_offset_x_m_, arena_offset_y_m_);
+    }
+
     void odometry_callback(const nav_msgs::msg::Odometry::ConstSharedPtr msg)
     {
-        const Eigen::Vector2d position(
+        const Eigen::Vector2d odom_position(
             msg->pose.pose.position.x, msg->pose.pose.position.y);
         const double z_m = msg->pose.pose.position.z;
-        const double yaw = yaw_from_quaternion(
+        const double odom_yaw = hydrophone_ctrl::ArenaFrameTransform::
+            yaw_from_quaternion(
             msg->pose.pose.orientation.w,
             msg->pose.pose.orientation.x,
             msg->pose.pose.orientation.y,
             msg->pose.pose.orientation.z);
-        if (!position.allFinite() || !std::isfinite(z_m) ||
-            !std::isfinite(yaw))
+        if (!odom_position.allFinite() || !std::isfinite(z_m) ||
+            !std::isfinite(odom_yaw))
         {
             return;
         }
+        if (!arena_transform_.initialized()) {
+            RCLCPP_WARN_THROTTLE(
+                get_logger(), *get_clock(), 5000,
+                "Waiting for external guided start frame");
+            return;
+        }
         const bool first_odometry = !have_odometry_;
-        current_position_ = position;
+        current_position_ =
+            arena_transform_.position_from_odom(odom_position);
         current_z_m_ = z_m;
-        current_yaw_rad_ = yaw;
-        odometry_frame_ =
-            msg->header.frame_id.empty() ? "odom" : msg->header.frame_id;
+        current_yaw_rad_ = arena_transform_.yaw_from_odom(odom_yaw);
         last_odometry_receive_time_ = now();
         have_odometry_ = true;
         const rclcpp::Time stamp(msg->header.stamp);
@@ -292,7 +338,7 @@ private:
             {
                 odometry_history_.clear();
             }
-            odometry_history_.push_back({stamp, position});
+            odometry_history_.push_back({stamp, current_position_});
             while (odometry_history_.size() > 300) {
                 odometry_history_.pop_front();
             }
@@ -742,7 +788,7 @@ private:
         yaw_pid_initialized_ = false;
         geometry_msgs::msg::PointStamped msg;
         msg.header.stamp = now();
-        msg.header.frame_id = odometry_frame_;
+        msg.header.frame_id = arena_frame_id_;
         msg.point.x = waypoint.x();
         msg.point.y = waypoint.y();
         waypoint_pub_->publish(msg);
@@ -752,7 +798,7 @@ private:
     {
         geometry_msgs::msg::PointStamped msg;
         msg.header.stamp = now();
-        msg.header.frame_id = odometry_frame_;
+        msg.header.frame_id = arena_frame_id_;
         msg.point.x = peak_position_.x();
         msg.point.y = peak_position_.y();
         peak_pub_->publish(msg);
@@ -873,14 +919,6 @@ private:
         return std::atan2(std::sin(angle), std::cos(angle));
     }
 
-    static double yaw_from_quaternion(
-        const double w, const double x, const double y, const double z)
-    {
-        return std::atan2(
-            2.0 * (w * z + x * y),
-            1.0 - 2.0 * (y * y + z * z));
-    }
-
     static const char * state_name(const State state)
     {
         switch (state) {
@@ -923,7 +961,7 @@ private:
     int line_search_direction_ = 1;
     std::string arena_start_corner_ = "bottom_left";
     std::string emergency_stop_key_ = "s";
-    std::string odometry_frame_ = "odom";
+    std::string arena_frame_id_ = "arena";
     State state_ = State::MOVE_TO_LINE_CENTER;
     bool have_odometry_ = false;
     bool have_snr_ = false;
@@ -956,11 +994,14 @@ private:
     std::optional<Eigen::Vector2d> last_sample_position_;
     std::deque<SnrSample> snr_filter_window_;
     std::deque<PoseSample> odometry_history_;
+    hydrophone_ctrl::ArenaFrameTransform arena_transform_;
     std::atomic_bool emergency_stop_active_{false};
     std::atomic_bool stop_keyboard_thread_{false};
     std::thread keyboard_thread_;
 
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odometry_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr
+        start_frame_sub_;
     rclcpp::Subscription<audio_common_msgs::msg::Float64Stamped>::SharedPtr snr_sub_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr target_confirmed_sub_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr emergency_stop_sub_;

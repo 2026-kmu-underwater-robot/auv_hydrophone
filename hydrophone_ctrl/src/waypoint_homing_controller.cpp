@@ -16,7 +16,9 @@
 #include <unistd.h>
 
 #include <Eigen/Dense>
+#include "hydrophone_ctrl/arena_frame_transform.hpp"
 #include <geometry_msgs/msg/point_stamped.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/vector3_stamped.hpp>
 #include <mavros_msgs/msg/override_rc_in.hpp>
 #include <nav_msgs/msg/odometry.hpp>
@@ -38,6 +40,8 @@ public:
     {
         const auto odometry_topic = declare_parameter<std::string>(
             "odometry_topic", "/odometry/filtered");
+        const auto start_frame_topic = declare_parameter<std::string>(
+            "start_frame_topic", "/guided/start_frame");
         const auto region_gradient_topic = declare_parameter<std::string>(
             "region_gradient_topic", "/homing/region_gradient");
         const auto rolling_gradient_topic = declare_parameter<std::string>(
@@ -48,6 +52,8 @@ public:
             "state_topic", "/homing/control_state");
         const auto waypoint_topic = declare_parameter<std::string>(
             "waypoint_topic", "/homing/current_waypoint");
+        arena_frame_id_ = declare_parameter<std::string>(
+            "arena_frame_id", "arena");
         const auto scan_center_topic = declare_parameter<std::string>(
             "scan_center_topic", "/homing/scan_center");
         const auto vision_search_request_topic = declare_parameter<std::string>(
@@ -132,6 +138,8 @@ public:
         if (!std::isfinite(target_depth_z_m_)) {
             throw std::invalid_argument("target_depth_z_m must be finite");
         }
+        depth_tolerance_m_ = std::max(
+            0.0, declare_parameter<double>("depth_tolerance_m", 0.10));
 
         rate_hz_ = std::clamp(
             declare_parameter<double>("rate_hz", 30.0), 1.0, 120.0);
@@ -161,6 +169,13 @@ public:
             odometry_topic, 30,
             std::bind(&WaypointHomingControllerNode::odometry_callback, this,
                 std::placeholders::_1));
+        start_frame_sub_ =
+            create_subscription<geometry_msgs::msg::PoseStamped>(
+                start_frame_topic,
+                rclcpp::QoS(1).reliable().transient_local(),
+                std::bind(
+                    &WaypointHomingControllerNode::start_frame_callback,
+                    this, std::placeholders::_1));
         region_gradient_sub_ = create_subscription<geometry_msgs::msg::Vector3Stamped>(
             region_gradient_topic, 10,
             std::bind(&WaypointHomingControllerNode::region_gradient_callback, this,
@@ -242,7 +257,6 @@ private:
     static constexpr double DEPTH_PROPORTIONAL_GAIN = 0.8;
     static constexpr double DEPTH_INTEGRAL_GAIN = 0.15;
     static constexpr double HEAVE_LIMIT = 0.2;
-    static constexpr double DEPTH_TOLERANCE_M = 0.05;
     static constexpr double REALIGN_HEADING_ERROR_RAD = PI / 3.0;
     static constexpr double YAW_DERIVATIVE_ALPHA = 0.2;
     static constexpr double SCAN_RADIAL_DERIVATIVE_ALPHA = 0.2;
@@ -288,25 +302,60 @@ private:
         double heave = 0.0;
     };
 
+    void start_frame_callback(
+        const geometry_msgs::msg::PoseStamped::ConstSharedPtr msg)
+    {
+        if (arena_transform_.initialized()) {
+            return;
+        }
+        const Eigen::Vector2d origin(
+            msg->pose.position.x, msg->pose.position.y);
+        const double yaw = hydrophone_ctrl::ArenaFrameTransform::
+            yaw_from_quaternion(
+            msg->pose.orientation.w,
+            msg->pose.orientation.x,
+            msg->pose.orientation.y,
+            msg->pose.orientation.z);
+        if (!origin.allFinite() || !std::isfinite(yaw)) {
+            RCLCPP_WARN(get_logger(), "Ignoring invalid guided start frame");
+            return;
+        }
+        arena_transform_.initialize(origin, yaw);
+        RCLCPP_INFO(
+            get_logger(),
+            "Guided start frame accepted: origin_odom=(%.3f, %.3f), "
+            "yaw_odom=%.3f rad; arena boundary offset in start frame=(%.2f, %.2f)",
+            origin.x(), origin.y(), yaw,
+            arena_offset_x_m_, arena_offset_y_m_);
+    }
+
     void odometry_callback(const nav_msgs::msg::Odometry::ConstSharedPtr msg)
     {
         // 현재 위치와 yaw를 업데이트한다.
-        const Eigen::Vector2d position(
+        const Eigen::Vector2d odom_position(
             msg->pose.pose.position.x, msg->pose.pose.position.y);
         const double z_m = msg->pose.pose.position.z;
-        const double yaw = yaw_from_quaternion(
+        const double odom_yaw = hydrophone_ctrl::ArenaFrameTransform::
+            yaw_from_quaternion(
             msg->pose.pose.orientation.w,
             msg->pose.pose.orientation.x,
             msg->pose.pose.orientation.y,
             msg->pose.pose.orientation.z);
-        if (!position.allFinite() || !std::isfinite(z_m) || !std::isfinite(yaw)) { // 위치와 yaw가 유효하지 않으면 무시한다.
+        if (!odom_position.allFinite() || !std::isfinite(z_m) ||
+            !std::isfinite(odom_yaw))
+        {
+            return;
+        }
+        if (!arena_transform_.initialized()) {
+            RCLCPP_WARN_THROTTLE(
+                get_logger(), *get_clock(), 5000,
+                "Waiting for external guided start frame");
             return;
         }
         const bool first_odometry = !have_odometry_;
-        current_position_ = position; // 현재 위치를 업데이트한다.
+        current_position_ = arena_transform_.position_from_odom(odom_position);
         current_z_m_ = z_m;
-        current_yaw_rad_ = yaw; // 현재 yaw를 업데이트한다.
-        odometry_frame_ = msg->header.frame_id.empty() ? "odom" : msg->header.frame_id; // 오돔 메세지가 어느 좌표계 기준인지 업데이트한다 (빈 문자열이면 odom 기준).
+        current_yaw_rad_ = arena_transform_.yaw_from_odom(odom_yaw);
         last_odometry_receive_time_ = now(); // 마지막 오도메트리 수신 시간을 업데이트한다.
         have_odometry_ = true; // 오도메트리 수신 여부를 업데이트한다.
 
@@ -880,7 +929,7 @@ private:
 
     bool depth_target_reached() const
     {
-        return std::abs(target_depth_z_m_ - current_z_m_) <= DEPTH_TOLERANCE_M;
+        return std::abs(target_depth_z_m_ - current_z_m_) <= depth_tolerance_m_;
     }
 
     void log_controller_status()
@@ -969,7 +1018,7 @@ private:
         reset_yaw_pid();
         geometry_msgs::msg::PointStamped msg;
         msg.header.stamp = now();
-        msg.header.frame_id = odometry_frame_;
+        msg.header.frame_id = arena_frame_id_;
         msg.point.x = waypoint.x();
         msg.point.y = waypoint.y();
         waypoint_pub_->publish(msg);
@@ -979,7 +1028,7 @@ private:
     {
         geometry_msgs::msg::PointStamped msg;
         msg.header.stamp = now();
-        msg.header.frame_id = odometry_frame_;
+        msg.header.frame_id = arena_frame_id_;
         msg.point.x = scan_center_.x();
         msg.point.y = scan_center_.y();
         scan_center_pub_->publish(msg);
@@ -1024,7 +1073,7 @@ private:
     {
         geometry_msgs::msg::Vector3Stamped msg;
         msg.header.stamp = now();
-        msg.header.frame_id = odometry_frame_;
+        msg.header.frame_id = arena_frame_id_;
         msg.vector.x = homing_direction_.x();
         msg.vector.y = homing_direction_.y();
         homing_direction_pub_->publish(msg);
@@ -1127,14 +1176,6 @@ private:
         return std::atan2(std::sin(angle), std::cos(angle));
     }
 
-    static double yaw_from_quaternion(
-        const double w, const double x, const double y, const double z)
-    {
-        return std::atan2(
-            2.0 * (w * z + x * y),
-            1.0 - 2.0 * (y * y + z * z));
-    }
-
     static const char * state_name(const State state)
     {
         switch (state) {
@@ -1175,6 +1216,7 @@ private:
     double scan_radial_integral_limit_ = 1.0;
     double vision_near_zone_width_m_ = 2.0;
     double target_depth_z_m_ = -0.65;
+    double depth_tolerance_m_ = 0.10;
     double rate_hz_ = 30.0;
     double odometry_timeout_s_ = 0.5;
     double forward_cruise_ = 0.5;
@@ -1190,7 +1232,7 @@ private:
     std::size_t rolling_gradient_conflict_count_ = 0;
     double zigzag_sign_ = 1.0;
     std::string arena_start_corner_ = "bottom_left";
-    std::string odometry_frame_ = "odom";
+    std::string arena_frame_id_ = "arena";
     bool invert_rc_yaw_ = true;
     bool vision_handoff_enabled_ = true;
     bool have_odometry_ = false;
@@ -1230,8 +1272,11 @@ private:
     Eigen::Vector2d region_gradient_{1.0, 0.0};
     Eigen::Vector2d homing_direction_{1.0, 0.0};
     std::vector<Eigen::Vector2d> waypoints_;
+    hydrophone_ctrl::ArenaFrameTransform arena_transform_;
 
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odometry_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr
+        start_frame_sub_;
     rclcpp::Subscription<geometry_msgs::msg::Vector3Stamped>::SharedPtr
         region_gradient_sub_;
     rclcpp::Subscription<geometry_msgs::msg::Vector3Stamped>::SharedPtr

@@ -13,8 +13,10 @@
 
 #include <audio_common_msgs/msg/float64_stamped.hpp>
 #include <Eigen/Dense>
+#include "hydrophone_ctrl/arena_frame_transform.hpp"
 #include <geometry_msgs/msg/point.hpp>
 #include <geometry_msgs/msg/point_stamped.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/vector3_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -38,6 +40,8 @@ public:
             "snr_topic", "/audio_frequency_detector/snr_db_stamped");
         const auto odometry_topic = declare_parameter<std::string>(
             "odometry_topic", "/odometry/filtered");
+        const auto start_frame_topic = declare_parameter<std::string>(
+            "start_frame_topic", "/guided/start_frame");
         const auto region_gradient_topic = declare_parameter<std::string>(
             "region_gradient_topic", "/homing/region_gradient");
         const auto rolling_gradient_topic = declare_parameter<std::string>(
@@ -50,6 +54,8 @@ public:
             "scan_center_topic", "/homing/scan_center");
         const auto marker_topic = declare_parameter<std::string>(
             "marker_topic", "/homing/rviz/markers");
+        arena_frame_id_ = declare_parameter<std::string>(
+            "arena_frame_id", "arena");
 
         arena_length_m_ = std::max(
             0.1, declare_parameter<double>("arena_length_m", 15.0));
@@ -104,6 +110,13 @@ public:
             odometry_topic, 30,
             std::bind(&RegionLocalGradientRvizVisualizerNode::odometry_callback, this,
                 std::placeholders::_1));
+        start_frame_sub_ =
+            create_subscription<geometry_msgs::msg::PoseStamped>(
+                start_frame_topic,
+                rclcpp::QoS(1).reliable().transient_local(),
+                std::bind(
+                    &RegionLocalGradientRvizVisualizerNode::start_frame_callback,
+                    this, std::placeholders::_1));
         region_gradient_sub_ = create_subscription<geometry_msgs::msg::Vector3Stamped>(
             region_gradient_topic, rclcpp::QoS(1).reliable().transient_local(),
             [this](const geometry_msgs::msg::Vector3Stamped::ConstSharedPtr msg) {
@@ -176,14 +189,45 @@ private:
         TOO_OLD
     };
 
-    void odometry_callback(const nav_msgs::msg::Odometry::ConstSharedPtr msg)
+    void start_frame_callback(
+        const geometry_msgs::msg::PoseStamped::ConstSharedPtr msg)
     {
-        const Eigen::Vector2d position(
-            msg->pose.pose.position.x, msg->pose.pose.position.y);
-        const rclcpp::Time stamp(msg->header.stamp);
-        if (!position.allFinite() || stamp.nanoseconds() <= 0) {
+        if (arena_transform_.initialized()) {
             return;
         }
+        const Eigen::Vector2d origin(
+            msg->pose.position.x, msg->pose.position.y);
+        const double yaw = hydrophone_ctrl::ArenaFrameTransform::
+            yaw_from_quaternion(
+            msg->pose.orientation.w,
+            msg->pose.orientation.x,
+            msg->pose.orientation.y,
+            msg->pose.orientation.z);
+        if (!origin.allFinite() || !std::isfinite(yaw)) {
+            RCLCPP_WARN(get_logger(), "Ignoring invalid guided start frame");
+            return;
+        }
+        arena_transform_.initialize(origin, yaw);
+        RCLCPP_INFO(
+            get_logger(),
+            "Guided start frame accepted: origin_odom=(%.3f, %.3f), "
+            "yaw_odom=%.3f rad; arena boundary offset in start frame=(%.2f, %.2f)",
+            origin.x(), origin.y(), yaw,
+            arena_offset_x_m_, arena_offset_y_m_);
+    }
+
+    void odometry_callback(const nav_msgs::msg::Odometry::ConstSharedPtr msg)
+    {
+        const Eigen::Vector2d odom_position(
+            msg->pose.pose.position.x, msg->pose.pose.position.y);
+        const rclcpp::Time stamp(msg->header.stamp);
+        if (!odom_position.allFinite() || stamp.nanoseconds() <= 0 ||
+            !arena_transform_.initialized())
+        {
+            return;
+        }
+        const Eigen::Vector2d position =
+            arena_transform_.position_from_odom(odom_position);
         if (!odometry_history_.empty() && stamp < odometry_history_.back().stamp) {
             odometry_history_.clear();
             pending_snr_.clear();
@@ -200,7 +244,6 @@ private:
         }
         current_position_ = position;
         have_odometry_ = true;
-        odometry_frame_ = msg->header.frame_id.empty() ? "odom" : msg->header.frame_id;
         process_pending_snr();
     }
 
@@ -356,11 +399,14 @@ private:
         const float blue) const
     {
         const double x_min = arena_offset_x_m_ + inset;
-        const double x_max = arena_offset_x_m_ + arena_length_m_ - inset;
+        const double x_max =
+            arena_offset_x_m_ + arena_length_m_ - inset;
         const double y_min = arena_start_corner_ == "bottom_left" ?
-            arena_offset_y_m_ - arena_width_m_ + inset : arena_offset_y_m_ + inset;
+            arena_offset_y_m_ - arena_width_m_ + inset :
+            arena_offset_y_m_ + inset;
         const double y_max = arena_start_corner_ == "bottom_left" ?
-            arena_offset_y_m_ - inset : arena_offset_y_m_ + arena_width_m_ - inset;
+            arena_offset_y_m_ - inset :
+            arena_offset_y_m_ + arena_width_m_ - inset;
 
         visualization_msgs::msg::Marker marker;
         set_marker_header(marker, stamp, name, 0);
@@ -389,7 +435,8 @@ private:
     visualization_msgs::msg::Marker make_vision_zone_marker(
         const rclcpp::Time & stamp) const
     {
-        const double safe_x_min = arena_offset_x_m_ + arena_safety_margin_m_;
+        const double safe_x_min =
+            arena_offset_x_m_ + arena_safety_margin_m_;
         const double safe_x_max =
             arena_offset_x_m_ + arena_length_m_ - arena_safety_margin_m_;
         const double safe_y_min = arena_start_corner_ == "bottom_left" ?
@@ -424,7 +471,8 @@ private:
     visualization_msgs::msg::Marker make_vision_zone_label_marker(
         const rclcpp::Time & stamp) const
     {
-        const double safe_x_min = arena_offset_x_m_ + arena_safety_margin_m_;
+        const double safe_x_min =
+            arena_offset_x_m_ + arena_safety_margin_m_;
         const double safe_x_max =
             arena_offset_x_m_ + arena_length_m_ - arena_safety_margin_m_;
         const double safe_y_min = arena_start_corner_ == "bottom_left" ?
@@ -700,7 +748,7 @@ private:
         const int id) const
     {
         marker.header.stamp = stamp;
-        marker.header.frame_id = odometry_frame_;
+        marker.header.frame_id = arena_frame_id_;
         marker.ns = name;
         marker.id = id;
     }
@@ -767,7 +815,7 @@ private:
     bool have_region_gradient_ = false;
     bool have_waypoint_ = false;
     bool have_scan_center_ = false;
-    std::string odometry_frame_ = "odom";
+    std::string arena_frame_id_ = "arena";
     std::string arena_start_corner_ = "bottom_left";
     Eigen::Vector2d current_position_{0.0, 0.0};
     Eigen::Vector2d current_waypoint_{0.0, 0.0};
@@ -780,9 +828,12 @@ private:
     std::deque<PoseSample> odometry_history_;
     std::deque<PendingSnr> pending_snr_;
     std::map<std::pair<int, int>, GridCell> grid_;
+    hydrophone_ctrl::ArenaFrameTransform arena_transform_;
 
     rclcpp::Subscription<audio_common_msgs::msg::Float64Stamped>::SharedPtr snr_sub_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odometry_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr
+        start_frame_sub_;
     rclcpp::Subscription<geometry_msgs::msg::Vector3Stamped>::SharedPtr
         region_gradient_sub_;
     rclcpp::Subscription<geometry_msgs::msg::Vector3Stamped>::SharedPtr

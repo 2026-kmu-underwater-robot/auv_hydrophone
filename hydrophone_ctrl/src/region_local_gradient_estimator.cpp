@@ -10,6 +10,8 @@
 
 #include <audio_common_msgs/msg/float64_stamped.hpp>
 #include <Eigen/Dense>
+#include "hydrophone_ctrl/arena_frame_transform.hpp"
+#include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/vector3_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -30,12 +32,16 @@ public:
             "snr_topic", "/audio_frequency_detector/snr_db_stamped");
         const auto odometry_topic = declare_parameter<std::string>(
             "odometry_topic", "/odometry/filtered");
+        const auto start_frame_topic = declare_parameter<std::string>(
+            "start_frame_topic", "/guided/start_frame");
         const auto state_topic = declare_parameter<std::string>(
             "state_topic", "/homing/control_state");
         const auto region_gradient_topic = declare_parameter<std::string>(
             "region_gradient_topic", "/homing/region_gradient");
         const auto rolling_gradient_topic = declare_parameter<std::string>(
             "rolling_gradient_topic", "/homing/rolling_gradient");
+        arena_frame_id_ = declare_parameter<std::string>(
+            "arena_frame_id", "arena");
         region_sample_spacing_m_ = std::max(
             0.01, declare_parameter<double>("region_sample_spacing_m", 0.15));
         homing_gradient_window_size_ =
@@ -63,6 +69,13 @@ public:
             odometry_topic, 30,
             std::bind(&RegionLocalGradientEstimatorNode::odometry_callback, this,
                 std::placeholders::_1));
+        start_frame_sub_ =
+            create_subscription<geometry_msgs::msg::PoseStamped>(
+                start_frame_topic,
+                rclcpp::QoS(1).reliable().transient_local(),
+                std::bind(
+                    &RegionLocalGradientEstimatorNode::start_frame_callback,
+                    this, std::placeholders::_1));
         state_sub_ = create_subscription<std_msgs::msg::String>(
             state_topic, rclcpp::QoS(1).reliable().transient_local(),
             std::bind(&RegionLocalGradientEstimatorNode::state_callback, this,
@@ -95,16 +108,45 @@ private:
         Eigen::Vector2d position{0.0, 0.0};
     };
 
+    void start_frame_callback(
+        const geometry_msgs::msg::PoseStamped::ConstSharedPtr msg)
+    {
+        if (arena_transform_.initialized()) {
+            return;
+        }
+        const Eigen::Vector2d origin(
+            msg->pose.position.x, msg->pose.position.y);
+        const double yaw = hydrophone_ctrl::ArenaFrameTransform::
+            yaw_from_quaternion(
+            msg->pose.orientation.w,
+            msg->pose.orientation.x,
+            msg->pose.orientation.y,
+            msg->pose.orientation.z);
+        if (!origin.allFinite() || !std::isfinite(yaw)) {
+            RCLCPP_WARN(get_logger(), "Ignoring invalid guided start frame");
+            return;
+        }
+        arena_transform_.initialize(origin, yaw);
+        RCLCPP_INFO(
+            get_logger(),
+            "Guided start frame accepted: origin_odom=(%.3f, %.3f), "
+            "yaw_odom=%.3f rad",
+            origin.x(), origin.y(), yaw);
+    }
+
 
 
     // 오돔 메세지를 받아 해당 지점의 위치와 시각 히스토리를 업데이트하는 콜백. --> odometry_history_ 업데이트 콜백
     void odometry_callback(const nav_msgs::msg::Odometry::ConstSharedPtr msg)
     {
-        const Eigen::Vector2d position(
+        const Eigen::Vector2d odom_position(
             msg->pose.pose.position.x, msg->pose.pose.position.y); // 오돔 메세지에서 현재 위치 추출
-        if (!position.allFinite()) { // 위치가 유효하지 않으면 무시.
+        if (!odom_position.allFinite() || !arena_transform_.initialized())
+        {
             return;
         }
+        const Eigen::Vector2d position =
+            arena_transform_.position_from_odom(odom_position);
         const rclcpp::Time stamp(msg->header.stamp);
         if (stamp.nanoseconds() <= 0) { // 타임스탬프가 없어도 무시.
             return;
@@ -116,7 +158,6 @@ private:
         while (odometry_history_.size() > 300) { // 히스토리 길이를 최대 300개로 제한한다.
             odometry_history_.pop_front();
         }
-        odometry_frame_ = msg->header.frame_id.empty() ? "odom" : msg->header.frame_id; // 오돔 메세지가 어느 좌표계 기준인지 업데이트한다 (빈 문자열이면 odom 기준).
         last_odometry_receive_time_ = now(); // 마지막 오도메트리 수신 시간을 업데이트한다.
     }
 
@@ -352,7 +393,7 @@ private:
     {
         geometry_msgs::msg::Vector3Stamped msg;
         msg.header.stamp = stamp;
-        msg.header.frame_id = odometry_frame_;
+        msg.header.frame_id = arena_frame_id_;
         msg.vector.x = gradient.x();
         msg.vector.y = gradient.y();
         publisher->publish(msg);
@@ -369,15 +410,18 @@ private:
     double max_snr_odom_skew_s_ = 0.15;
 
     std::string state_;
-    std::string odometry_frame_ = "odom";
+    std::string arena_frame_id_ = "arena";
     rclcpp::Time last_odometry_receive_time_;
     std::optional<Eigen::Vector2d> last_homing_position_;
     std::deque<PoseSample> odometry_history_; //위치와 해당 시각을 저장하는 큐
     std::vector<Sample> scan_samples_;
     std::deque<Sample> homing_samples_;
+    hydrophone_ctrl::ArenaFrameTransform arena_transform_;
 
     rclcpp::Subscription<audio_common_msgs::msg::Float64Stamped>::SharedPtr snr_sub_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odometry_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr
+        start_frame_sub_;
     rclcpp::Subscription<std_msgs::msg::String>::SharedPtr state_sub_;
     rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr region_gradient_pub_;
     rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr rolling_gradient_pub_;
