@@ -10,7 +10,7 @@ from launch_ros.parameter_descriptions import ParameterValue
 # ros2 launch hydrophone_ctrl region_local_gradient_homing.launch.py \
 #   use_sim_time:=false \
 #   arena_start_corner:=bottom_left \
-#   arena_length_m:=5.49 \
+#   arena_length_m:=5.50 \
 #   arena_width_m:=2.74 \
 #   arena_offset_x_m:=-0.30 \
 #   arena_offset_y_m:=0.30 \ (bottom_left면 양수로, bottom_right면 음수로)

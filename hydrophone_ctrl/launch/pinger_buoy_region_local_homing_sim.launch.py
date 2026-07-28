@@ -87,7 +87,7 @@ def generate_launch_description():
         ("region_sample_spacing_m", "0.15"),
         ("min_region_gradient_magnitude", "0.05"),
         ("min_region_lateral_spread_m", "0.10"),
-        ("vision_near_zone_width_m", "0.50"),
+        ("vision_near_zone_width_m", "0.60"),
         # ("vision_near_zone_width_m", "2.0"),
         ("acoustic_timeout_s", "300.0"),
         ("forward_cruise", "0.70"),
