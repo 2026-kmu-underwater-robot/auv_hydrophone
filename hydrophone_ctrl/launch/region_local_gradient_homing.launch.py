@@ -84,7 +84,7 @@ def generate_launch_description():
             "odometry_topic", default_value="/odometry/filtered"
         ),  # 입력 odometry 토픽
         DeclareLaunchArgument(
-            "start_frame_topic", default_value="/guided/start_frame"
+            "start_frame_topic", default_value="/start_frame"
         ),
         DeclareLaunchArgument(
             "arena_frame_id", default_value="arena"

@@ -11,7 +11,7 @@ from launch_ros.parameter_descriptions import ParameterValue
 def generate_launch_description():
     use_sim_time = LaunchConfiguration("use_sim_time")
     raw_odometry_topic = LaunchConfiguration("raw_odometry_topic")
-    homing_odometry_topic = LaunchConfiguration("homing_odometry_topic")
+    odometry_topic = LaunchConfiguration("odometry_topic")
     signal_mode = LaunchConfiguration("signal_mode")
     noise_bag = LaunchConfiguration("noise_bag")
     frequency_hz = LaunchConfiguration("frequency_hz")
@@ -131,13 +131,17 @@ def generate_launch_description():
             description="region 또는 line_search. 두 제어기는 동시에 실행하지 않는다.",
         ),
         DeclareLaunchArgument(
-            "raw_odometry_topic", default_value="/odometry/filtered"
+            "raw_odometry_topic",
+            default_value="/odometry/mujoco_raw",
+            description="MuJoCo absolute world odometry.",
         ),
         DeclareLaunchArgument(
-            "homing_odometry_topic", default_value="/homing/sim_odometry"
+            "odometry_topic",
+            default_value="/odometry/filtered",
+            description="Rebased odometry for control/start_frame (XY zeroed).",
         ),
         DeclareLaunchArgument(
-            "start_frame_topic", default_value="/homing/sim_start_frame"
+            "start_frame_topic", default_value="/start_frame"
         ),
         DeclareLaunchArgument("arena_frame_id", default_value="arena"),
         DeclareLaunchArgument(
@@ -243,11 +247,7 @@ def generate_launch_description():
             {
                 "use_sim_time": ParameterValue(use_sim_time, value_type=bool),
                 "input_topic": raw_odometry_topic,
-                "output_topic": homing_odometry_topic,
-                "start_frame_input_topic": "/guided/start_frame",
-                "start_frame_output_topic": LaunchConfiguration(
-                    "start_frame_topic"
-                ),
+                "output_topic": odometry_topic,
             }
         ],
     )
@@ -262,7 +262,7 @@ def generate_launch_description():
         ),
         launch_arguments={
             "use_sim_time": use_sim_time,
-            "odometry_topic": homing_odometry_topic,
+            "odometry_topic": odometry_topic,
             "start_frame_topic": LaunchConfiguration("start_frame_topic"),
             "arena_frame_id": LaunchConfiguration("arena_frame_id"),
             "arena_start_corner": LaunchConfiguration("arena_start_corner"),
@@ -317,7 +317,7 @@ def generate_launch_description():
         ),
         launch_arguments={
             "use_sim_time": use_sim_time,
-            "odometry_topic": homing_odometry_topic,
+            "odometry_topic": odometry_topic,
             "start_frame_topic": LaunchConfiguration("start_frame_topic"),
             "arena_frame_id": LaunchConfiguration("arena_frame_id"),
             "arena_start_corner": LaunchConfiguration("arena_start_corner"),
@@ -395,7 +395,7 @@ def generate_launch_description():
         condition=IfCondition(launch_rviz),
         launch_arguments={
             "use_sim_time": use_sim_time,
-            "odometry_topic": homing_odometry_topic,
+            "odometry_topic": odometry_topic,
             "start_frame_topic": LaunchConfiguration("start_frame_topic"),
             "arena_frame_id": LaunchConfiguration("arena_frame_id"),
             "arena_length_m": LaunchConfiguration("arena_length_m"),

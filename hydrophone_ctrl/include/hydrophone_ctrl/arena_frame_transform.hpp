@@ -42,7 +42,7 @@ public:
     Eigen::Vector2d position_from_odom(
         const Eigen::Vector2d & odom_position) const
     {
-        // odom 위치를 /guided/start_frame 기준 위치로 변환한다.
+        // odom 위치를 /start_frame 기준 위치로 변환한다.
         require_initialized();
         const Eigen::Vector2d relative = odom_position - odom_origin_;
         return {
@@ -52,7 +52,7 @@ public:
 
     double yaw_from_odom(const double odom_yaw_rad) const
     {
-        // odom 기준 yaw를 /guided/start_frame 기준 yaw로 변환한다.
+        // odom 기준 yaw를 /start_frame 기준 yaw로 변환한다.
         require_initialized();
         return wrap_pi(odom_yaw_rad - initial_yaw_rad_);
     }

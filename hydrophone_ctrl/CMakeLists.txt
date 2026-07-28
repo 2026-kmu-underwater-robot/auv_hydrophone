@@ -16,6 +16,7 @@ add_library(${PROJECT_NAME} SHARED
   src/near_zone_line_search_controller.cpp
   src/region_local_gradient_estimator.cpp
   src/region_local_gradient_rviz_visualizer.cpp
+  src/start_frame_publisher.cpp
   src/waypoint_homing_controller.cpp
 )
 
@@ -57,6 +58,11 @@ rclcpp_components_register_node(
   PLUGIN "audio_capture::RegionLocalGradientRvizVisualizerNode"
   EXECUTABLE region_local_gradient_rviz_visualizer
 )
+rclcpp_components_register_node(
+  ${PROJECT_NAME}
+  PLUGIN "hydrophone_ctrl::StartFramePublisherNode"
+  EXECUTABLE start_frame_publisher
+)
 
 install(
   TARGETS
@@ -65,6 +71,7 @@ install(
     waypoint_homing_controller
     near_zone_line_search_controller
     region_local_gradient_rviz_visualizer
+    start_frame_publisher
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION lib/${PROJECT_NAME}

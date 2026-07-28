@@ -20,7 +20,7 @@ def generate_launch_description():
         DeclareLaunchArgument("use_sim_time", default_value="false"),
         DeclareLaunchArgument("odometry_topic", default_value="/odometry/filtered"),
         DeclareLaunchArgument(
-            "start_frame_topic", default_value="/guided/start_frame"
+            "start_frame_topic", default_value="/start_frame"
         ),
         DeclareLaunchArgument("arena_frame_id", default_value="arena"),
         DeclareLaunchArgument(

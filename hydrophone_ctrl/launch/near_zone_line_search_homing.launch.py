@@ -8,7 +8,7 @@ from launch_ros.parameter_descriptions import ParameterValue
 def generate_launch_description():
     string_names = [
         ("odometry_topic", "/odometry/filtered"),
-        ("start_frame_topic", "/guided/start_frame"),
+        ("start_frame_topic", "/start_frame"),
         ("snr_topic", "/audio_frequency_detector/snr_db_stamped"),
         ("state_topic", "/homing/control_state"),
         ("waypoint_topic", "/homing/current_waypoint"),

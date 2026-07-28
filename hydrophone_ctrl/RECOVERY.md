@@ -19,7 +19,7 @@ start frame:
 `p_start = R(-yaw_start_in_odom) * (p_odom - origin_start_in_odom)`
 
 The start origin and yaw come from the external transient-local
-`/guided/start_frame` (`geometry_msgs/msg/PoseStamped`) message. The hydrophone
+`/start_frame` (`geometry_msgs/msg/PoseStamped`) message. The hydrophone
 nodes do not capture their own yaw. Horizontal position, SNR sample positions,
 gradients, waypoints, and RViz markers use the start frame. Controller yaw is
 `yaw_start = wrap(yaw_odom - yaw_start_in_odom)`, so it is zero only at the

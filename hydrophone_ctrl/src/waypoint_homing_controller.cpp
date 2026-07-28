@@ -41,7 +41,7 @@ public:
         const auto odometry_topic = declare_parameter<std::string>(
             "odometry_topic", "/odometry/filtered");
         const auto start_frame_topic = declare_parameter<std::string>(
-            "start_frame_topic", "/guided/start_frame");
+            "start_frame_topic", "/start_frame");
         const auto region_gradient_topic = declare_parameter<std::string>(
             "region_gradient_topic", "/homing/region_gradient");
         const auto rolling_gradient_topic = declare_parameter<std::string>(

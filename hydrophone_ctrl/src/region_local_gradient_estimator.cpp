@@ -33,7 +33,7 @@ public:
         const auto odometry_topic = declare_parameter<std::string>(
             "odometry_topic", "/odometry/filtered");
         const auto start_frame_topic = declare_parameter<std::string>(
-            "start_frame_topic", "/guided/start_frame");
+            "start_frame_topic", "/start_frame");
         const auto state_topic = declare_parameter<std::string>(
             "state_topic", "/homing/control_state");
         const auto region_gradient_topic = declare_parameter<std::string>(
