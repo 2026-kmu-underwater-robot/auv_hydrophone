@@ -35,8 +35,8 @@ def generate_launch_description():
     float_names = [
         ("arena_length_m", "15.0"),  # 수조 길이
         ("arena_width_m", "16.0"),  # 수조 너비
-        ("arena_offset_x_m", "0.0"),  # 수조 원점 X 오프셋
-        ("arena_offset_y_m", "0.0"),  # 수조 원점 Y 오프셋
+        ("arena_offset_x_m", "-0.30"),  # 수조 원점 X 오프셋
+        ("arena_offset_y_m", "0.30"),  # 수조 원점 Y 오프셋
         ("arena_safety_margin_m", "0.5"),  # 벽으로부터의 안전 여유
         ("initial_scan_radius_m", "1.5"),  # 최초 원형 스캔 반경
         ("rescan_radius_m", "0.7"),  # 재스캔 원형 반경
@@ -50,7 +50,7 @@ def generate_launch_description():
         ("min_region_gradient_magnitude", "0.05"),  # 유효 그래디언트 최소 크기
         ("min_region_lateral_spread_m", "0.10"),  # 유효 피팅용 최소 횡방향 퍼짐
         ("vision_near_zone_width_m", "2.0"),  # 비전 인계용 근접 구간 폭
-        ("target_depth_z_m", "-0.65"),  # 목표 수심 (odom z)
+        ("target_depth_z_m", "-0.10"),  # 목표 수심 (odom z)
         ("odometry_timeout_s", "0.5"),  # odometry 신선도 타임아웃
         ("fcu_state_timeout_s", "1.0"),  # FCU 상태 신선도 타임아웃
         ("handoff_hold_sec", "0.7"),  # 인계 전 정지 상태 유지 시간

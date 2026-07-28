@@ -81,6 +81,12 @@ public:
         vision_near_zone_width_m_ = std::clamp(
             declare_parameter<double>("vision_near_zone_width_m", 2.0),
             0.0, arena_width_m_);
+        // 0 이하면 Acoustic 타임아웃 핸드오프를 끈다.
+        // line_search는 zone 안에서 동작하므로 zone 진입이 아니라 peak/timeout에서 인계한다.
+        acoustic_timeout_s_ = declare_parameter<double>("acoustic_timeout_s", 90.0);
+        if (!std::isfinite(acoustic_timeout_s_)) {
+            throw std::invalid_argument("acoustic_timeout_s must be finite");
+        }
         arena_start_corner_ = declare_parameter<std::string>(
             "arena_start_corner", "bottom_left");
         if (arena_start_corner_ != "bottom_left" &&
@@ -211,9 +217,10 @@ public:
         }
         RCLCPP_INFO(
             get_logger(),
-            "Near-zone line search ready: drop=%.1f dB count=%zu spacing=%.2f m",
+            "Near-zone line search ready: drop=%.1f dB count=%zu spacing=%.2f m "
+            "acoustic_timeout_s=%.1f (search request in zone; peak/confirm/timeout -> grant)",
             snr_drop_from_peak_db_, snr_decline_count_limit_,
-            snr_sample_spacing_m_);
+            snr_sample_spacing_m_, acoustic_timeout_s_);
     }
 
     ~NearZoneLineSearchControllerNode() override
@@ -243,7 +250,6 @@ private:
         MOVE_TO_LINE_CENTER,
         LINE_SEARCH,
         RETURN_TO_PEAK,
-        WAIT_VISION_TARGET,
         HANDOFF_NEUTRAL,
         HANDOFF_COMPLETE
     };
@@ -346,6 +352,7 @@ private:
 
         if (first_odometry) {
             initial_z_m_ = current_z_m_;
+            start_acoustic_deadline_if_needed(now());
             line_center_ = nearest_near_zone_center(current_position_);
             set_current_waypoint(line_center_);
             publish_state();
@@ -431,15 +438,70 @@ private:
     void target_confirmed_callback(
         const std_msgs::msg::Bool::ConstSharedPtr msg)
     {
-        if (!msg->data || !vision_search_requested_ ||
-            state_ != State::WAIT_VISION_TARGET)
-        {
+        if (!msg->data || !vision_search_requested_ || handoff_in_progress()) {
             return;
         }
+        begin_vision_handoff("target_confirmed");
+    }
+
+    bool handoff_in_progress() const
+    {
+        return state_ == State::HANDOFF_NEUTRAL ||
+            state_ == State::HANDOFF_COMPLETE;
+    }
+
+    void start_acoustic_deadline_if_needed(const rclcpp::Time & current_time)
+    {
+        if (acoustic_deadline_started_ || acoustic_timeout_s_ <= 0.0) {
+            return;
+        }
+        acoustic_deadline_started_ = true;
+        acoustic_start_time_ = current_time;
+        RCLCPP_INFO(
+            get_logger(),
+            "[VISION] acoustic deadline started (%.1f s)",
+            acoustic_timeout_s_);
+    }
+
+    bool acoustic_deadline_expired(const rclcpp::Time & current_time) const
+    {
+        return acoustic_deadline_started_ &&
+            acoustic_timeout_s_ > 0.0 &&
+            (current_time - acoustic_start_time_).seconds() >= acoustic_timeout_s_;
+    }
+
+    // line-search는 이미 near zone에서 동작하므로 탐색 요청만 먼저 보낸다.
+    void request_vision_confirmation()
+    {
+        if (vision_search_requested_ || handoff_in_progress()) {
+            return;
+        }
+        vision_search_requested_ = true;
+        publish_vision_control_granted(false);
+        publish_vision_search_request(true);
+        RCLCPP_INFO(
+            get_logger(),
+            "[VISION] search requested at position=(%.2f, %.2f); acoustic control kept",
+            current_position_.x(), current_position_.y());
+    }
+
+    // peak 복귀 / confirm / timeout 시 중립 후 Vision에 제어권을 넘긴다.
+    void begin_vision_handoff(const char * reason)
+    {
+        if (handoff_in_progress()) {
+            return;
+        }
+        if (!vision_search_requested_) {
+            request_vision_confirmation();
+        }
         handoff_neutral_sent_ = false;
+        reset_motion_controllers();
+        publish_rc(Command{});
         transition_to(State::HANDOFF_NEUTRAL);
         RCLCPP_INFO(
-            get_logger(), "[VISION] target confirmed; neutral handoff started");
+            get_logger(),
+            "[VISION] acoustic handoff started reason=%s position=(%.2f, %.2f)",
+            reason, current_position_.x(), current_position_.y());
     }
 
     void emergency_stop_callback(
@@ -475,9 +537,7 @@ private:
             }
             return;
         }
-        if (state_ == State::WAIT_VISION_TARGET ||
-            state_ == State::HANDOFF_COMPLETE)
-        {
+        if (state_ == State::HANDOFF_COMPLETE) {
             return;
         }
         if (!odometry_is_fresh(current_time)) {
@@ -486,6 +546,11 @@ private:
             return;
         }
         log_status();
+
+        if (acoustic_deadline_expired(current_time)) {
+            begin_vision_handoff("acoustic_timeout");
+            return;
+        }
 
         switch (state_) {
             case State::MOVE_TO_LINE_CENTER:
@@ -505,15 +570,18 @@ private:
                     return;
                 }
                 if (follow_waypoint(current_time)) {
-                    begin_return_to_peak("line_boundary");
+                    if (have_peak_) {
+                        begin_return_to_peak("line_boundary");
+                    } else {
+                        begin_vision_handoff("line_boundary");
+                    }
                 }
                 return;
             case State::RETURN_TO_PEAK:
                 if (follow_waypoint(current_time)) {
-                    begin_vision_wait();
+                    begin_vision_handoff("snr_peak");
                 }
                 return;
-            case State::WAIT_VISION_TARGET:
             case State::HANDOFF_NEUTRAL:
             case State::HANDOFF_COMPLETE:
                 return;
@@ -532,6 +600,7 @@ private:
         decline_count_ = 0;
         last_sample_position_.reset();
         snr_filter_window_.clear();
+        request_vision_confirmation();
         transition_to(State::LINE_SEARCH);
         set_current_waypoint(line_endpoint_);
         RCLCPP_INFO(
@@ -556,19 +625,6 @@ private:
             get_logger(),
             "[LINE] return reason=%s peak=%.1f dB position=(%.2f, %.2f)",
             reason, peak_snr_db_, peak_position_.x(), peak_position_.y());
-    }
-
-    void begin_vision_wait()
-    {
-        vision_search_requested_ = true;
-        publish_vision_control_granted(false);
-        publish_vision_search_request(true);
-        reset_motion_controllers();
-        publish_rc(Command{});
-        transition_to(State::WAIT_VISION_TARGET);
-        RCLCPP_INFO(
-            get_logger(),
-            "[VISION] peak reached; waiting for target confirmation");
     }
 
     bool follow_waypoint(const rclcpp::Time & current_time)
@@ -925,7 +981,6 @@ private:
             case State::MOVE_TO_LINE_CENTER: return "MOVE_TO_LINE_CENTER";
             case State::LINE_SEARCH: return "LINE_SEARCH";
             case State::RETURN_TO_PEAK: return "RETURN_TO_PEAK";
-            case State::WAIT_VISION_TARGET: return "WAIT_VISION_TARGET";
             case State::HANDOFF_NEUTRAL: return "HANDOFF_NEUTRAL";
             case State::HANDOFF_COMPLETE: return "HANDOFF_COMPLETE";
         }
@@ -938,6 +993,7 @@ private:
     double arena_offset_y_m_ = 0.0;
     double arena_safety_margin_m_ = 0.5;
     double vision_near_zone_width_m_ = 2.0;
+    double acoustic_timeout_s_ = 90.0;
     double target_depth_z_m_ = -8.0;
     double line_search_start_depth_tolerance_m_ = 0.2;
     double waypoint_reach_tolerance_m_ = 0.15;
@@ -970,6 +1026,7 @@ private:
     bool return_to_peak_requested_ = false;
     bool vision_search_requested_ = false;
     bool handoff_neutral_sent_ = false;
+    bool acoustic_deadline_started_ = false;
     bool invert_rc_yaw_ = true;
     bool yaw_pid_initialized_ = false;
     bool depth_pid_initialized_ = false;
@@ -978,6 +1035,7 @@ private:
     rclcpp::Time last_yaw_control_time_;
     rclcpp::Time last_depth_control_time_;
     rclcpp::Time handoff_neutral_time_;
+    rclcpp::Time acoustic_start_time_;
     double current_z_m_ = 0.0;
     double initial_z_m_ = 0.0;
     double current_yaw_rad_ = 0.0;

@@ -70,7 +70,7 @@ def generate_launch_description():
         ("arena_offset_x_m", "-0.30"),
         ("arena_offset_y_m", "0.30"),
         ("arena_safety_margin_m", "0.40"),
-        ("initial_scan_radius_m", "0.70"),
+        ("initial_scan_radius_m", "0.40"),
         ("rescan_radius_m", "0.50"),
         ("homing_waypoint_step_m", "0.50"),
         ("homing_zigzag_offset_m", "0.15"),
@@ -87,8 +87,9 @@ def generate_launch_description():
         ("region_sample_spacing_m", "0.15"),
         ("min_region_gradient_magnitude", "0.05"),
         ("min_region_lateral_spread_m", "0.10"),
-        ("vision_near_zone_width_m", "0.60"),
+        ("vision_near_zone_width_m", "0.50"),
         # ("vision_near_zone_width_m", "2.0"),
+        ("acoustic_timeout_s", "300.0"),
         ("forward_cruise", "0.70"),
         ("yaw_kp", "1.00"),
         ("yaw_ki", "0.15"),
@@ -116,6 +117,7 @@ def generate_launch_description():
         ("odometry_timeout_s", "0.5"),
         ("rc_pwm_span", "400.0"),
         ("rate_hz", "30.0"),
+        # acoustic_timeout_s는 homing_float_names에서 공유한다.
     ]
     line_search_int_names = [
         ("line_search_direction", "1"),
@@ -331,6 +333,7 @@ def generate_launch_description():
             "vision_near_zone_width_m": LaunchConfiguration(
                 "vision_near_zone_width_m"
             ),
+            "acoustic_timeout_s": LaunchConfiguration("acoustic_timeout_s"),
             "target_depth_z_m": LaunchConfiguration("target_depth_z_m"),
             "line_search_start_depth_tolerance_m": LaunchConfiguration(
                 "line_search_start_depth_tolerance_m"

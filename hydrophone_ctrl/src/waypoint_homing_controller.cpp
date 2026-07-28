@@ -134,6 +134,11 @@ public:
             0.0, arena_width_m_);
         vision_handoff_enabled_ = declare_parameter<bool>(
             "vision_handoff_enabled", true);
+        // 0 이하면 Acoustic 타임아웃 핸드오프를 끈다. near zone 진입 시에는 즉시 인계한다.
+        acoustic_timeout_s_ = declare_parameter<double>("acoustic_timeout_s", 90.0);
+        if (!std::isfinite(acoustic_timeout_s_)) {
+            throw std::invalid_argument("acoustic_timeout_s must be finite");
+        }
         target_depth_z_m_ = declare_parameter<double>("target_depth_z_m", -0.65);
         if (!std::isfinite(target_depth_z_m_)) {
             throw std::invalid_argument("target_depth_z_m must be finite");
@@ -235,8 +240,10 @@ public:
         const ArenaBounds bounds = arena_bounds(0.0);
         RCLCPP_INFO(
             get_logger(),
-            "Waypoint controller ready: arena x=[%.3f, %.3f] y=[%.3f, %.3f]",
-            bounds.x_min, bounds.x_max, bounds.y_min, bounds.y_max);
+            "Waypoint controller ready: arena x=[%.3f, %.3f] y=[%.3f, %.3f], "
+            "acoustic_timeout_s=%.1f (near-zone request; boundary/confirm/timeout -> grant)",
+            bounds.x_min, bounds.x_max, bounds.y_min, bounds.y_max,
+            acoustic_timeout_s_);
     }
 
     ~WaypointHomingControllerNode() override
@@ -268,9 +275,8 @@ private:
         MOVE_TO_SCAN_START,     //원형 궤도 시작점으로 이동 상태
         REGION_SCAN,    //원형 탐색 상태
         REGION_HOMING,    //원형 탐색 결과 그래디언트 매칭 상태
-        WAIT_VISION_TARGET,    // [ACOUSTIC-VISION HANDSHAKE] 경계에서 Vision 확정을 기다린다.
-        HANDOFF_NEUTRAL,       // [ACOUSTIC-VISION HANDSHAKE] 중립 RC를 딱 한 번 보낸다.
-        HANDOFF_COMPLETE       // [ACOUSTIC-VISION HANDSHAKE] Acoustic RC를 영구 종료한다.
+        HANDOFF_NEUTRAL,  // [ACOUSTIC-VISION HANDSHAKE] 중립 RC를 딱 한 번 보낸다.
+        HANDOFF_COMPLETE  // [ACOUSTIC-VISION HANDSHAKE] Acoustic RC를 영구 종료한다.
     };
 
     enum class HomingWaypointResult
@@ -360,6 +366,7 @@ private:
         have_odometry_ = true; // 오도메트리 수신 여부를 업데이트한다.
 
         if (first_odometry) { // 최초 odometry 수신 시 미션을 시작한다.
+            start_acoustic_deadline_if_needed(now());
             start_new_region_scan(arena_center(), true); // 최초 탐색은 실험장 중앙에서 시작.
         }
     }
@@ -437,15 +444,17 @@ private:
     void target_confirmed_callback(const std_msgs::msg::Bool::ConstSharedPtr msg)
     {
         if (!msg->data || !vision_handoff_enabled_ ||
-            !vision_search_requested_ ||
-            (state_ != State::REGION_HOMING && state_ != State::WAIT_VISION_TARGET))
+            !vision_search_requested_ || handoff_in_progress())
         {
             return;
         }
-        // [ACOUSTIC-VISION HANDSHAKE RESTORED] Vision 확정 뒤에만 중립·grant를 시작한다.
-        handoff_neutral_sent_ = false;
-        transition_to(State::HANDOFF_NEUTRAL);
-        RCLCPP_INFO(get_logger(), "[VISION] target confirmed; neutral handoff started");
+        begin_vision_handoff("target_confirmed");
+    }
+
+    bool handoff_in_progress() const
+    {
+        return state_ == State::HANDOFF_NEUTRAL ||
+            state_ == State::HANDOFF_COMPLETE;
     }
 
     bool inside_vision_zone(const Eigen::Vector2d & position) const
@@ -467,12 +476,33 @@ private:
         return inside_vision_zone(current_position_);
     }
 
-    // [ACOUSTIC-VISION HANDSHAKE RESTORED] Near zone에서 Vision 확인을 요청하지만
-    // target_confirmed 전까지는 Acoustic이 제어권을 유지한다.
-    bool request_vision_confirmation()
+    void start_acoustic_deadline_if_needed(const rclcpp::Time & current_time)
     {
-        if (vision_search_requested_) {
-            return false;
+        if (acoustic_deadline_started_ || acoustic_timeout_s_ <= 0.0) {
+            return;
+        }
+        acoustic_deadline_started_ = true;
+        acoustic_start_time_ = current_time;
+        RCLCPP_INFO(
+            get_logger(),
+            "[VISION] acoustic deadline started (%.1f s)",
+            acoustic_timeout_s_);
+    }
+
+    bool acoustic_deadline_expired(const rclcpp::Time & current_time) const
+    {
+        return acoustic_deadline_started_ &&
+            acoustic_timeout_s_ > 0.0 &&
+            (current_time - acoustic_start_time_).seconds() >= acoustic_timeout_s_;
+    }
+
+    // near zone 진입 시 Vision에게 탐색만 요청하고 Acoustic 제어는 유지한다.
+    void request_vision_confirmation()
+    {
+        if (!vision_handoff_enabled_ || vision_search_requested_ ||
+            handoff_in_progress())
+        {
+            return;
         }
         vision_search_requested_ = true;
         publish_vision_control_granted(false);
@@ -481,31 +511,31 @@ private:
         publish_homing_direction();
         RCLCPP_INFO(
             get_logger(),
-            "[VISION] target confirmation requested at position=(%.2f, %.2f) m",
+            "[VISION] search requested at position=(%.2f, %.2f); acoustic control kept",
             current_position_.x(), current_position_.y());
-        return true;
     }
 
-    void begin_vision_confirmation_homing()
+    // 경계 직전 / confirm / timeout 시 중립 후 Vision에 제어권을 넘긴다.
+    void begin_vision_handoff(const char * reason)
     {
-        request_vision_confirmation();
-        const HomingWaypointResult result = make_next_homing_waypoint();
-        if (result == HomingWaypointResult::CREATED) {
-            set_current_waypoint(waypoints_.front());
+        if (!vision_handoff_enabled_ || handoff_in_progress()) {
             return;
         }
-        begin_vision_wait();
-    }
-
-    void begin_vision_wait()
-    {
-        request_vision_confirmation();
+        if (!vision_search_requested_) {
+            vision_search_requested_ = true;
+            publish_vision_control_granted(false);
+            publish_vision_search_request(true);
+            rolling_gradient_conflict_count_ = 0;
+            publish_homing_direction();
+        }
+        handoff_neutral_sent_ = false;
         reset_yaw_pid();
         publish_rc(Command{});
-        transition_to(State::WAIT_VISION_TARGET);
+        transition_to(State::HANDOFF_NEUTRAL);
         RCLCPP_INFO(
             get_logger(),
-            "[VISION] arena boundary reached; waiting for target confirmation");
+            "[VISION] acoustic handoff started reason=%s position=(%.2f, %.2f)",
+            reason, current_position_.x(), current_position_.y());
     }
 
     void control_loop()
@@ -535,7 +565,7 @@ private:
             }
             return;
         }
-        if (state_ == State::WAIT_VISION_TARGET || state_ == State::HANDOFF_COMPLETE) {
+        if (state_ == State::HANDOFF_COMPLETE) {
             depth_control_time_initialized_ = false;
             reset_yaw_pid();
             log_controller_status();
@@ -549,11 +579,14 @@ private:
         }
         log_controller_status();
 
-        if (state_ == State::REGION_HOMING && vision_handoff_enabled_ &&
-            inside_vision_zone() && !vision_search_requested_)
-        {
-            begin_vision_confirmation_homing();
+        if (acoustic_deadline_expired(current_time)) {
+            begin_vision_handoff("acoustic_timeout");
             return;
+        }
+        if (state_ == State::REGION_HOMING && vision_handoff_enabled_ &&
+            inside_vision_zone())
+        {
+            request_vision_confirmation();
         }
 
         switch (state_) {
@@ -600,7 +633,6 @@ private:
                 handle_homing_waypoint_result(make_next_homing_waypoint());
                 return;
 
-            case State::WAIT_VISION_TARGET:
             case State::HANDOFF_NEUTRAL:
             case State::HANDOFF_COMPLETE:
                 return;
@@ -609,6 +641,9 @@ private:
 
     void start_new_region_scan(const Eigen::Vector2d & requested_center, const bool force = false)
     {
+        if (handoff_in_progress()) {
+            return;
+        }
         if (vision_search_requested_) {
             publish_vision_search_request(false);
             vision_search_requested_ = false;
@@ -690,7 +725,8 @@ private:
             next_centerline + zigzag_sign_ * homing_zigzag_offset_m_ * normal;
 
         if (vision_handoff_enabled_ && inside_vision_zone(waypoint)) {
-            return HomingWaypointResult::VISION_ZONE;
+            // near zone 안으로는 계속 들어가고, 안전경계 직전에서만 handoff 한다.
+            request_vision_confirmation();
         }
         if (!waypoint_is_safe(waypoint)) {
             return HomingWaypointResult::BOUNDARY;
@@ -709,7 +745,8 @@ private:
             return;
         }
         if (result == HomingWaypointResult::VISION_ZONE) {
-            begin_vision_confirmation_homing();
+            request_vision_confirmation();
+            handle_homing_boundary();
             return;
         }
         handle_homing_boundary();
@@ -717,10 +754,11 @@ private:
 
     void handle_homing_boundary()
     {
-        if (vision_search_requested_ ||
-            (vision_handoff_enabled_ && inside_vision_zone()))
+        // arena_safety_margin 안쪽 한계 = 경계 직전. near zone/handshake 중이면 Vision에 넘긴다.
+        if (vision_handoff_enabled_ &&
+            (vision_search_requested_ || inside_vision_zone()))
         {
-            begin_vision_wait();
+            begin_vision_handoff("arena_boundary");
             return;
         }
         publish_rc(depth_hold_command(now()));
@@ -934,8 +972,7 @@ private:
 
     void log_controller_status()
     {
-        if (state_ == State::WAIT_VISION_TARGET ||
-            state_ == State::HANDOFF_NEUTRAL ||
+        if (state_ == State::HANDOFF_NEUTRAL ||
             state_ == State::HANDOFF_COMPLETE)
         {
             RCLCPP_INFO_THROTTLE(
@@ -1187,8 +1224,6 @@ private:
                 return "REGION_SCAN";
             case State::REGION_HOMING:
                 return "REGION_HOMING";
-            case State::WAIT_VISION_TARGET:
-                return "WAIT_VISION_TARGET";
             case State::HANDOFF_NEUTRAL:
                 return "HANDOFF_NEUTRAL";
             case State::HANDOFF_COMPLETE:
@@ -1215,6 +1250,7 @@ private:
     double scan_radial_kd_ = 0.3;
     double scan_radial_integral_limit_ = 1.0;
     double vision_near_zone_width_m_ = 2.0;
+    double acoustic_timeout_s_ = 90.0;
     double target_depth_z_m_ = -0.65;
     double depth_tolerance_m_ = 0.10;
     double rate_hz_ = 30.0;
@@ -1235,6 +1271,7 @@ private:
     std::string arena_frame_id_ = "arena";
     bool invert_rc_yaw_ = true;
     bool vision_handoff_enabled_ = true;
+    bool acoustic_deadline_started_ = false;
     bool have_odometry_ = false;
     bool waypoint_heading_aligned_ = false;
     bool rescan_requested_ = false;
@@ -1252,6 +1289,7 @@ private:
     rclcpp::Time last_yaw_control_time_;
     rclcpp::Time last_scan_radial_control_time_;
     rclcpp::Time handoff_neutral_time_;
+    rclcpp::Time acoustic_start_time_;
     double current_yaw_rad_ = 0.0;
     double current_z_m_ = 0.0;
     double depth_error_integral_ = 0.0;

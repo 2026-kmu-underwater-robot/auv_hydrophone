@@ -13,7 +13,7 @@ from launch_ros.parameter_descriptions import ParameterValue
 #   arena_length_m:=5.49 \
 #   arena_width_m:=2.74 \
 #   arena_offset_x_m:=-0.30 \
-#   arena_offset_y_m:=0.30 \ (bottom_left=-Y, bottom_right=+Y)
+#   arena_offset_y_m:=0.30 \ (bottom_left면 음수로, bottom_right면 양수로)
 #   arena_safety_margin_m:=0.30 \
 #   initial_scan_radius_m:=1.00 \
 #   rescan_radius_m:=0.50 \
@@ -56,6 +56,7 @@ def generate_launch_description():
         ("min_region_gradient_magnitude", "0.05"),  # 유효 그래디언트 최소 크기
         ("min_region_lateral_spread_m", "0.10"),  # 유효 피팅용 최소 횡방향 퍼짐
         ("vision_near_zone_width_m", "2.0"),  # 비전 인계용 근접 구간 폭
+        ("acoustic_timeout_s", "90.0"),  # Acoustic 예산; 초과 시 Vision에 즉시 grant
         ("target_depth_z_m", "-0.65"),  # 목표 수심 (odom z)
         ("depth_tolerance_m", "0.10"),  # 목표 수심 도달 허용오차
         ("odometry_timeout_s", "0.5"),  # odometry 신선도 타임아웃
@@ -228,6 +229,7 @@ def generate_launch_description():
         "scan_radial_kd",
         "scan_radial_integral_limit",
         "vision_near_zone_width_m",
+        "acoustic_timeout_s",
         "target_depth_z_m",
         "depth_tolerance_m",
         "odometry_timeout_s",

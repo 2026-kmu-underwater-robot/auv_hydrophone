@@ -29,6 +29,7 @@ def generate_launch_description():
         ("arena_offset_y_m", "0.0"),
         ("arena_safety_margin_m", "0.5"),
         ("vision_near_zone_width_m", "2.0"),
+        ("acoustic_timeout_s", "90.0"),
         ("target_depth_z_m", "-8.0"),
         ("line_search_start_depth_tolerance_m", "0.2"),
         ("waypoint_reach_tolerance_m", "0.15"),
