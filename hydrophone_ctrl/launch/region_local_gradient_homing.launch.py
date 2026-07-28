@@ -13,14 +13,15 @@ from launch_ros.parameter_descriptions import ParameterValue
 #   arena_length_m:=5.49 \
 #   arena_width_m:=2.74 \
 #   arena_offset_x_m:=-0.30 \
-#   arena_offset_y_m:=0.30 \ (bottom_left면 음수로, bottom_right면 양수로)
-#   arena_safety_margin_m:=0.30 \
-#   initial_scan_radius_m:=1.00 \
+#   arena_offset_y_m:=0.30 \ (bottom_left면 양수로, bottom_right면 음수로)
+#   arena_safety_margin_m:=0.40 \
+#   initial_scan_radius_m:=0.40 \
 #   rescan_radius_m:=0.50 \
 #   homing_waypoint_step_m:=0.50 \
 #   homing_zigzag_offset_m:=0.15 \
-#   vision_near_zone_width_m:=0.60 \
-#   forward_cruise:=0.25
+#   vision_near_zone_width_m:=0.40 \
+#   forward_cruise:=0.35 \
+#   target_depth_z_m:=-0.65  # 목표 수심 (odom z)
 
 
 def generate_launch_description():
