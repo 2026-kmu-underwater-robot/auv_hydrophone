@@ -173,7 +173,7 @@ def generate_launch_description():
         condition=IfCondition(launch_rviz),
         launch_arguments={
             "config_file": config_file,
-            "use_sim_time": "true",
+            "use_sim_time": "false",
         }.items(),
     )
 

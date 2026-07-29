@@ -13,22 +13,22 @@
 
 pinger_buoy_audio_sim:
   ros__parameters:
-    use_sim_time: true
+    use_sim_time: false
     odometry_topic: /odometry/mujoco_raw
 
 sim_odometry_rebaser:
   ros__parameters:
-    use_sim_time: true
+    use_sim_time: false
     input_topic: /odometry/mujoco_raw
     output_topic: /odometry/filtered
 
 audio_frequency_detector:
   ros__parameters:
-    use_sim_time: true
+    use_sim_time: false
 
 region_local_gradient_estimator:
   ros__parameters:
-    use_sim_time: true
+    use_sim_time: false
 
     # 토픽과 좌표계
     odometry_topic: /odometry/filtered
@@ -50,7 +50,7 @@ region_local_gradient_estimator:
 
 waypoint_homing_controller:
   ros__parameters:
-    use_sim_time: true
+    use_sim_time: false
 
     # 토픽과 좌표계
     odometry_topic: /odometry/filtered
@@ -122,7 +122,7 @@ waypoint_homing_controller:
 
 near_zone_line_search_controller:
   ros__parameters:
-    use_sim_time: true
+    use_sim_time: false
 
     # 토픽과 좌표계
     odometry_topic: /odometry/filtered
@@ -187,7 +187,7 @@ near_zone_line_search_controller:
 
 region_local_gradient_rviz_visualizer:
   ros__parameters:
-    use_sim_time: true
+    use_sim_time: false
     odometry_topic: /odometry/filtered
     start_frame_topic: /start_frame
     arena_frame_id: arena
