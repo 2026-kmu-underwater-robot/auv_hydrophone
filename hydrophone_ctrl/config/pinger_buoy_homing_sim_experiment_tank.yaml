@@ -72,7 +72,7 @@ waypoint_homing_controller:
     arena_start_corner: bottom_left
     invert_rc_yaw: true
     vision_handoff_enabled: true
-    acoustic_timeout_s: 90.0
+    acoustic_timeout_s: 9999.0
     odometry_timeout_s: 0.5
     rate_hz: 30.0
 

@@ -1,5 +1,10 @@
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.actions import (
+    DeclareLaunchArgument,
+    GroupAction,
+    IncludeLaunchDescription,
+    SetLaunchConfiguration,
+)
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, PythonExpression
@@ -114,16 +119,26 @@ def generate_launch_description():
         parameters=[config_file],
     )
 
-    region_homing = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            PathJoinSubstitution(
-                [package_share, "launch", "region_local_gradient_homing.launch.py"]
-            )
-        ),
+    region_homing = GroupAction(
         condition=IfCondition(
             PythonExpression(["'", controller_mode, "' == 'region'"])
         ),
-        launch_arguments={"config_file": config_file}.items(),
+        scoped=True,
+        actions=[
+            SetLaunchConfiguration("launch_rviz", "false"),
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    PathJoinSubstitution(
+                        [
+                            package_share,
+                            "launch",
+                            "region_local_gradient_homing.launch.py",
+                        ]
+                    )
+                ),
+                launch_arguments={"config_file": config_file}.items(),
+            ),
+        ],
     )
 
     line_search_detector = Node(
