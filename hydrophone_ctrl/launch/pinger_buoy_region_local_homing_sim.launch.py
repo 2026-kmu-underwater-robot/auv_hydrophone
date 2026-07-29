@@ -76,6 +76,8 @@ def generate_launch_description():
         ("homing_zigzag_offset_m", "0.15"),
         ("target_depth_z_m", "-0.65"),
         ("depth_tolerance_m", "0.10"),
+        ("depth_kp", "0.8"),
+        ("depth_ki", "0.15"),
 
         ("rolling_gradient_alpha", "0.15"),
         ("rolling_gradient_conflict_angle_rad", "1.0472"),

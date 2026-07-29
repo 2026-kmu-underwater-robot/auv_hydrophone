@@ -9,11 +9,11 @@ from launch_ros.parameter_descriptions import ParameterValue
 # 실험 수조버전 런치
 # ros2 launch hydrophone_ctrl region_local_gradient_homing.launch.py \
 #   use_sim_time:=false \
-#   arena_start_corner:=bottom_left \
+#   arena_start_corner:=bottom_right \
 #   arena_length_m:=5.50 \
 #   arena_width_m:=2.74 \
 #   arena_offset_x_m:=-0.30 \
-#   arena_offset_y_m:=0.30 \ (bottom_left면 양수로, bottom_right면 음수로)
+#   arena_offset_y_m:=-0.30 \
 #   arena_safety_margin_m:=0.40 \
 #   initial_scan_radius_m:=0.40 \
 #   rescan_radius_m:=0.50 \
@@ -21,7 +21,11 @@ from launch_ros.parameter_descriptions import ParameterValue
 #   homing_zigzag_offset_m:=0.15 \
 #   vision_near_zone_width_m:=0.40 \
 #   forward_cruise:=0.35 \
-#   target_depth_z_m:=-0.65  # 목표 수심 (odom z)
+#   target_depth_z_m:=-0.60 \
+#   depth_kp:=1.2 \
+#   depth_ki:=0.15  
+
+#   arena_offset_y_m:=-0.30 \ (bottom_left면 양수로, bottom_right면 음수로)
 
 
 def generate_launch_description():
@@ -58,8 +62,10 @@ def generate_launch_description():
         ("min_region_lateral_spread_m", "0.10"),  # 유효 피팅용 최소 횡방향 퍼짐
         ("vision_near_zone_width_m", "2.0"),  # 비전 인계용 근접 구간 폭
         ("acoustic_timeout_s", "90.0"),  # Acoustic 예산; 초과 시 Vision에 즉시 grant
-        ("target_depth_z_m", "-0.65"),  # 목표 수심 (odom z)
+        ("target_depth_z_m", "-2.05"),  # 목표 수심 (odom z)
         ("depth_tolerance_m", "0.10"),  # 목표 수심 도달 허용오차
+        ("depth_kp", "0.8"),  # 수심 오차 P 게인
+        ("depth_ki", "0.15"),  # 수심 오차 I 게인
         ("odometry_timeout_s", "0.5"),  # odometry 신선도 타임아웃
         ("max_snr_odom_skew_s", "0.15"),  # SNR-odometry 시각 허용 오차
         ("forward_cruise", "0.5"),  # 정렬 후 전진 RC 명령 크기
@@ -233,6 +239,8 @@ def generate_launch_description():
         "acoustic_timeout_s",
         "target_depth_z_m",
         "depth_tolerance_m",
+        "depth_kp",
+        "depth_ki",
         "odometry_timeout_s",
         "forward_cruise",
         "yaw_kp",
