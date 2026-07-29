@@ -1,13 +1,15 @@
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
+from launch_ros.substitutions import FindPackageShare
 import os
 
 
 def generate_launch_description():
+    config_file = LaunchConfiguration("config_file")
     use_sim_time = LaunchConfiguration("use_sim_time")
     marker_topic = LaunchConfiguration("marker_topic")
     rviz_config = os.path.join(
@@ -16,7 +18,20 @@ def generate_launch_description():
         "region_local_gradient.rviz",
     )
 
+    default_config_file = PathJoinSubstitution(
+        [
+            FindPackageShare("hydrophone_ctrl"),
+            "config",
+            "region_local_gradient_homing_competition_tank.yaml",
+        ]
+    )
+
     arguments = [
+        DeclareLaunchArgument(
+            "config_file",
+            default_value=default_config_file,
+            description="Optional profile YAML for the visualizer.",
+        ),
         DeclareLaunchArgument("use_sim_time", default_value="false"),
         DeclareLaunchArgument("odometry_topic", default_value="/odometry/filtered"),
         DeclareLaunchArgument(
@@ -116,7 +131,8 @@ def generate_launch_description():
                 "snr_color_max_db": ParameterValue(
                     LaunchConfiguration("snr_color_max_db"), value_type=float
                 ),
-            }
+            },
+            config_file,
         ],
     )
     rviz = Node(

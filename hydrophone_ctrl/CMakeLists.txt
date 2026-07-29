@@ -77,7 +77,7 @@ install(
   RUNTIME DESTINATION lib/${PROJECT_NAME}
 )
 
-install(DIRECTORY launch rviz
+install(DIRECTORY config launch rviz
   DESTINATION share/${PROJECT_NAME}
 )
 install(DIRECTORY include/

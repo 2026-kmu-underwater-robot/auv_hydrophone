@@ -149,6 +149,14 @@ public:
             0.0, declare_parameter<double>("depth_kp", 0.8));
         depth_ki_ = std::max(
             0.0, declare_parameter<double>("depth_ki", 0.15));
+        depth_kd_ = std::max(
+            0.0, declare_parameter<double>("depth_kd", 0.0));
+        depth_bias_ = declare_parameter<double>("depth_bias", 0.0);
+        if (!std::isfinite(depth_bias_)) {
+            throw std::invalid_argument("depth_bias must be finite");
+        }
+        heave_limit_ = std::clamp(
+            declare_parameter<double>("heave_limit", 0.2), 0.0, 1.0);
 
         rate_hz_ = std::clamp(
             declare_parameter<double>("rate_hz", 30.0), 1.0, 120.0);
@@ -245,10 +253,11 @@ public:
         RCLCPP_INFO(
             get_logger(),
             "Waypoint controller ready: arena x=[%.3f, %.3f] y=[%.3f, %.3f], "
-            "depth_pi=(kp=%.3f, ki=%.3f), acoustic_timeout_s=%.1f "
+            "depth_pid=(kp=%.3f, ki=%.3f, kd=%.3f), "
+            "depth_bias=%.3f, heave_limit=%.3f, acoustic_timeout_s=%.1f "
             "(near-zone request; boundary/confirm/timeout -> grant)",
             bounds.x_min, bounds.x_max, bounds.y_min, bounds.y_max,
-            depth_kp_, depth_ki_,
+            depth_kp_, depth_ki_, depth_kd_, depth_bias_, heave_limit_,
             acoustic_timeout_s_);
     }
 
@@ -267,7 +276,6 @@ private:
     static constexpr std::size_t YAW_CHANNEL_INDEX = 3;
     static constexpr std::size_t FORWARD_CHANNEL_INDEX = 4;
     static constexpr std::size_t LATERAL_CHANNEL_INDEX = 5;
-    static constexpr double HEAVE_LIMIT = 0.2;
     static constexpr double REALIGN_HEADING_ERROR_RAD = PI / 3.0;
     static constexpr double YAW_DERIVATIVE_ALPHA = 0.2;
     static constexpr double SCAN_RADIAL_DERIVATIVE_ALPHA = 0.2;
@@ -945,25 +953,35 @@ private:
         const double error = target_depth_z_m_ - current_z_m_;
 
         double dt = 0.0;
+        double error_derivative = 0.0;
         if (depth_control_time_initialized_) {
             dt = std::clamp(
                 (current_time - last_depth_control_time_).seconds(), 0.0, 0.2);
+            if (dt > 1.0e-6) {
+                error_derivative = (error - previous_depth_error_) / dt;
+            }
         }
         last_depth_control_time_ = current_time;
+        previous_depth_error_ = error;
         depth_control_time_initialized_ = true;
 
         const double candidate_integral = depth_error_integral_ + error * dt;
-        const double candidate_heave = -(
-            depth_kp_ * error + depth_ki_ * candidate_integral);
-        if (std::abs(candidate_heave) <= HEAVE_LIMIT ||
-            (candidate_heave > HEAVE_LIMIT && error > 0.0) ||
-            (candidate_heave < -HEAVE_LIMIT && error < 0.0))
+        const double candidate_heave = depth_bias_ - (
+            depth_kp_ * error +
+            depth_ki_ * candidate_integral +
+            depth_kd_ * error_derivative);
+        if (std::abs(candidate_heave) <= heave_limit_ ||
+            (candidate_heave > heave_limit_ && error > 0.0) ||
+            (candidate_heave < -heave_limit_ && error < 0.0))
         {
             depth_error_integral_ = candidate_integral;
         }
         command.heave = std::clamp(
-            -(depth_kp_ * error + depth_ki_ * depth_error_integral_),
-            -HEAVE_LIMIT, HEAVE_LIMIT);
+            depth_bias_ - (
+                depth_kp_ * error +
+                depth_ki_ * depth_error_integral_ +
+                depth_kd_ * error_derivative),
+            -heave_limit_, heave_limit_);
         return command;
     }
 
@@ -1257,6 +1275,9 @@ private:
     double depth_tolerance_m_ = 0.10;
     double depth_kp_ = 0.8;
     double depth_ki_ = 0.15;
+    double depth_kd_ = 0.0;
+    double depth_bias_ = 0.0;
+    double heave_limit_ = 0.2;
     double rate_hz_ = 30.0;
     double odometry_timeout_s_ = 0.5;
     double forward_cruise_ = 0.5;
@@ -1296,6 +1317,7 @@ private:
     rclcpp::Time acoustic_start_time_;
     double current_yaw_rad_ = 0.0;
     double current_z_m_ = 0.0;
+    double previous_depth_error_ = 0.0;
     double depth_error_integral_ = 0.0;
     double previous_yaw_error_ = 0.0;
     double yaw_error_integral_ = 0.0;

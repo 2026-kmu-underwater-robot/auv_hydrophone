@@ -1,0 +1,143 @@
+# Region Local Gradient Homing - 실험 수조 파라미터
+#
+# 실행:
+#   ros2 launch hydrophone_ctrl region_local_gradient_homing.launch.py \
+#     config_file:=/home/kim/new_hydrophone_ws/src/hydrophone_ctrl/config/region_local_gradient_homing_experiment_tank.yaml
+#
+# arena_offset_y_m 부호:
+#   bottom_left면 양수, bottom_right면 음수
+
+audio_frequency_detector:
+  ros__parameters:
+    use_sim_time: false 
+
+region_local_gradient_estimator:
+  ros__parameters:
+    use_sim_time: false  
+
+    # 토픽과 좌표계
+    odometry_topic: /odometry/filtered 
+    start_frame_topic: /start_frame 
+    snr_topic: /audio_frequency_detector/snr_db_stamped  # SNR 입력 토픽
+    state_topic: /homing/control_state 
+    region_gradient_topic: /homing/region_gradient  
+    rolling_gradient_topic: /homing/rolling_gradient
+    arena_frame_id: arena  
+
+    # 그래디언트 추정
+    region_sample_spacing_m: 0.15  # SNR 샘플 최소 이동 간격
+    homing_gradient_window_size: 12  # 롤링 그래디언트 윈도우 크기
+    min_homing_gradient_samples: 8  # 롤링 그래디언트 피팅 최소 샘플 수
+    min_region_gradient_magnitude: 0.05  # 유효 그래디언트 최소 크기
+    min_region_lateral_spread_m: 0.10  # 유효 피팅용 최소 횡방향 퍼짐
+    odometry_timeout_s: 0.5  # odometry 타임아웃
+    max_snr_odom_skew_s: 0.15  # SNR-odometry 시각 허용 오차
+
+waypoint_homing_controller:
+  ros__parameters:
+    use_sim_time: false
+
+    # 토픽과 좌표계
+    odometry_topic: /odometry/filtered
+    start_frame_topic: /start_frame
+    state_topic: /homing/control_state
+    waypoint_topic: /homing/current_waypoint 
+    scan_center_topic: /homing/scan_center 
+    region_gradient_topic: /homing/region_gradient  
+    rolling_gradient_topic: /homing/rolling_gradient  
+    homing_direction_topic: /homing/homing_direction  
+    vision_search_request_topic: /homing/vision_search_active  # 비전 탐색 활성화 요청 토픽
+    target_confirmed_topic: /vision/target_confirmed  # 비전 타깃 확정 응답 토픽
+    # Acoustic 제어 종료 후 Vision RC 발행을 허용하는 최종 승인 토픽
+    vision_control_granted_topic: /homing/vision_control_granted
+    rc_override_topic: /mavros/rc/override 
+    emergency_stop_topic: /mission/emergency_stop  # 미션 비상정지 토픽
+    arena_frame_id: arena  
+
+    # 미션과 안전
+    enable_keyboard_emergency_stop: true  # 키보드 비상 중립 기능 사용 여부
+    emergency_stop_key: s  # 비상 중립을 latch할 키
+    # 수조 시작 코너: bottom_left(수조 안쪽=-Y) 또는 bottom_right(수조 안쪽=+Y)
+    # 초기 진행 방향은 항상 arena +X다.
+    arena_start_corner: bottom_right
+    invert_rc_yaw: true  # RC yaw 채널 부호 반전
+    vision_handoff_enabled: true  # 근접 구간에서 비전 인계 사용 여부
+    acoustic_timeout_s: 90.0  # Acoustic 예산; 초과 시 Vision에 즉시 제어권 승인
+    odometry_timeout_s: 0.5  # odometry 타임아웃
+    rate_hz: 30.0  # 제어 루프 주기
+
+    # 수조 경계
+    arena_length_m: 5.50  # 수조 길이
+    arena_width_m: 2.74  # 수조 너비
+    arena_offset_x_m: -0.30  # 시작 좌표계 기준 수조 경계 X 오프셋
+    arena_offset_y_m: -0.30  # 시작 좌표계 기준 수조 경계 Y 오프셋
+    arena_safety_margin_m: 0.40  # 벽으로부터의 안전 여유
+
+    # 원형 스캔과 호밍
+    initial_scan_radius_m: 0.40  # 최초 원형 스캔 반경
+    rescan_radius_m: 0.50  # 재스캔 원형 반경
+    homing_waypoint_step_m: 0.50  # 호밍 한 스텝 전진 거리
+    homing_zigzag_offset_m: 0.15  # 호밍 좌우 지그재그 오프셋
+    rolling_gradient_alpha: 0.15  # 롤링 그래디언트 방향 스무딩 비율
+    rolling_gradient_conflict_angle_rad: 1.0472  # 방향 충돌 판정 각도(약 60도)
+    rolling_gradient_conflict_limit: 3  # 큰 방향 충돌 연속 허용 횟수
+    waypoint_reach_tolerance_m: 0.15  # waypoint 도착 판정 반경
+    scan_radial_kp: 1.5  # 원형 스캔 반경 오차 P 게인
+    scan_radial_ki: 0.05  # 원형 스캔 반경 오차 I 게인
+    scan_radial_kd: 0.3  # 원형 스캔 반경 오차 D 게인
+    scan_radial_integral_limit: 1.0  # 반경 오차 적분 제한
+    vision_near_zone_width_m: 0.40  # 비전 인계용 근접 구간 폭
+
+    # 수심 PID
+    # depth PID 출력은 정규화 heave 명령이며 rc_pwm_span을 곱해 PWM으로 변환한다.
+    target_depth_z_m: -0.60  # 목표 수심(odom z)
+    depth_tolerance_m: 0.15  # 목표 수심 도달 허용오차
+    depth_kp: 0.8  # 수심 오차 P 게인
+    depth_ki: 0.15  # 수심 오차 I 게인
+    depth_kd: 0.02  # 수심 오차 D 게인
+    depth_bias: 0.1  # 양성부력 보상 bias; 0.1은 rc_pwm_span=400에서 약 40 PWM
+    heave_limit: 0.4  # heave 명령 절댓값 제한; 0.4는 약 160 PWM
+
+    # 수평 RC 제어
+    forward_cruise: 0.35  # 정렬 후 전진 RC 명령 크기
+    yaw_kp: 1.15  # yaw 오차 비례 게인
+    yaw_ki: 0.15  # 지속 yaw 오차 제거용 적분 게인
+    yaw_kd: 0.08  # yaw 오차 변화 감쇠 게인
+    yaw_integral_limit: 2.0  # yaw 적분 누적 제한(rad*s)
+    yaw_limit: 0.72  # yaw 명령 최대 크기
+    move_heading_tolerance_rad: 0.1745  # 전진 허용 헤딩 오차
+    vision_heading_tolerance_rad: 0.12  # Vision 확인 중 전진 허용 헤딩 오차
+    rc_pwm_span: 400.0  # RC 중립값 1500 기준 ±PWM 스팬
+
+region_local_gradient_rviz_visualizer:
+  ros__parameters:
+    use_sim_time: false
+
+    # 토픽과 좌표계
+    odometry_topic: /odometry/filtered
+    start_frame_topic: /start_frame
+    snr_topic: /audio_frequency_detector/snr_db_stamped
+    region_gradient_topic: /homing/region_gradient
+    rolling_gradient_topic: /homing/rolling_gradient
+    homing_direction_topic: /homing/homing_direction
+    waypoint_topic: /homing/current_waypoint
+    scan_center_topic: /homing/scan_center
+    marker_topic: /homing/rviz/markers
+    arena_frame_id: arena
+
+    # 수조 경계: waypoint_homing_controller와 반드시 동일하게 유지한다.
+    arena_start_corner: bottom_right
+    arena_length_m: 5.50
+    arena_width_m: 2.74
+    arena_offset_x_m: -0.30
+    arena_offset_y_m: -0.30
+    arena_safety_margin_m: 0.40
+    vision_near_zone_width_m: 0.40
+
+    # 시각화
+    map_cell_size_m: 0.15
+    arrow_length_m: 1.0
+    publish_rate_hz: 5.0
+    dynamic_snr_range: true
+    snr_color_min_db: -10.0
+    snr_color_max_db: 20.0

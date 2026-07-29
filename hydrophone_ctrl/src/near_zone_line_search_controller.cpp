@@ -102,9 +102,26 @@ public:
         }
 
         target_depth_z_m_ = declare_parameter<double>("target_depth_z_m", -8.0);
+        if (!std::isfinite(target_depth_z_m_)) {
+            throw std::invalid_argument("target_depth_z_m must be finite");
+        }
         line_search_start_depth_tolerance_m_ = std::max(
             0.0, declare_parameter<double>(
                 "line_search_start_depth_tolerance_m", 0.2));
+        depth_kp_ = std::max(
+            0.0, declare_parameter<double>("depth_kp", 0.8));
+        depth_ki_ = std::max(
+            0.0, declare_parameter<double>("depth_ki", 0.15));
+        depth_kd_ = std::max(
+            0.0, declare_parameter<double>("depth_kd", 0.0));
+        depth_bias_ = declare_parameter<double>("depth_bias", 0.0);
+        if (!std::isfinite(depth_bias_)) {
+            throw std::invalid_argument("depth_bias must be finite");
+        }
+        depth_integral_limit_ = std::max(
+            0.0, declare_parameter<double>("depth_integral_limit", 2.0));
+        heave_limit_ = std::clamp(
+            declare_parameter<double>("heave_limit", 0.2), 0.0, 1.0);
         waypoint_reach_tolerance_m_ = std::max(
             0.01, declare_parameter<double>("waypoint_reach_tolerance_m", 0.15));
         snr_sample_spacing_m_ = std::max(
@@ -218,9 +235,12 @@ public:
         RCLCPP_INFO(
             get_logger(),
             "Near-zone line search ready: drop=%.1f dB count=%zu spacing=%.2f m "
-            "acoustic_timeout_s=%.1f (search request in zone; peak/confirm/timeout -> grant)",
+            "acoustic_timeout_s=%.1f depth_target=%.2f PID=(%.3f, %.3f, %.3f) "
+            "bias=%.3f heave_limit=%.3f "
+            "(search request in zone; peak/confirm/timeout -> grant)",
             snr_drop_from_peak_db_, snr_decline_count_limit_,
-            snr_sample_spacing_m_, acoustic_timeout_s_);
+            snr_sample_spacing_m_, acoustic_timeout_s_, target_depth_z_m_,
+            depth_kp_, depth_ki_, depth_kd_, depth_bias_, heave_limit_);
     }
 
     ~NearZoneLineSearchControllerNode() override
@@ -238,10 +258,6 @@ private:
     static constexpr std::size_t YAW_CHANNEL_INDEX = 3;
     static constexpr std::size_t FORWARD_CHANNEL_INDEX = 4;
     static constexpr std::size_t LATERAL_CHANNEL_INDEX = 5;
-    static constexpr double DEPTH_KP = 0.8;
-    static constexpr double DEPTH_KI = 0.15;
-    static constexpr double DEPTH_INTEGRAL_LIMIT = 2.0;
-    static constexpr double HEAVE_LIMIT = 0.2;
     static constexpr double YAW_DERIVATIVE_ALPHA = 0.2;
     static constexpr double REALIGN_HEADING_ERROR_RAD = PI / 3.0;
 
@@ -659,26 +675,37 @@ private:
     {
         const double error = target_depth_z_m_ - current_z_m_;
         double dt = 0.0;
+        double error_derivative = 0.0;
         if (depth_pid_initialized_) {
             dt = std::clamp(
                 (current_time - last_depth_control_time_).seconds(), 0.0, 0.2);
+            if (dt > 1.0e-6) {
+                error_derivative = (error - previous_depth_error_) / dt;
+            }
         }
         last_depth_control_time_ = current_time;
+        previous_depth_error_ = error;
         depth_pid_initialized_ = true;
         const double candidate_integral = std::clamp(
             depth_error_integral_ + error * dt,
-            -DEPTH_INTEGRAL_LIMIT, DEPTH_INTEGRAL_LIMIT);
-        const double candidate_heave =
-            -(DEPTH_KP * error + DEPTH_KI * candidate_integral);
-        if (std::abs(candidate_heave) <= HEAVE_LIMIT ||
-            candidate_heave * error > 0.0)
+            -depth_integral_limit_, depth_integral_limit_);
+        const double candidate_heave = depth_bias_ - (
+            depth_kp_ * error +
+            depth_ki_ * candidate_integral +
+            depth_kd_ * error_derivative);
+        if (std::abs(candidate_heave) <= heave_limit_ ||
+            (candidate_heave > heave_limit_ && error > 0.0) ||
+            (candidate_heave < -heave_limit_ && error < 0.0))
         {
             depth_error_integral_ = candidate_integral;
         }
         Command command;
         command.heave = std::clamp(
-            -(DEPTH_KP * error + DEPTH_KI * depth_error_integral_),
-            -HEAVE_LIMIT, HEAVE_LIMIT);
+            depth_bias_ - (
+                depth_kp_ * error +
+                depth_ki_ * depth_error_integral_ +
+                depth_kd_ * error_derivative),
+            -heave_limit_, heave_limit_);
         return command;
     }
 
@@ -723,6 +750,7 @@ private:
         yaw_pid_initialized_ = false;
         depth_pid_initialized_ = false;
         previous_yaw_error_ = 0.0;
+        previous_depth_error_ = 0.0;
         yaw_error_integral_ = 0.0;
         yaw_error_derivative_ = 0.0;
         depth_error_integral_ = 0.0;
@@ -996,6 +1024,12 @@ private:
     double acoustic_timeout_s_ = 90.0;
     double target_depth_z_m_ = -8.0;
     double line_search_start_depth_tolerance_m_ = 0.2;
+    double depth_kp_ = 0.8;
+    double depth_ki_ = 0.15;
+    double depth_kd_ = 0.0;
+    double depth_bias_ = 0.0;
+    double depth_integral_limit_ = 2.0;
+    double heave_limit_ = 0.2;
     double waypoint_reach_tolerance_m_ = 0.15;
     double snr_sample_spacing_m_ = 0.15;
     double snr_drop_from_peak_db_ = 2.0;
@@ -1041,6 +1075,7 @@ private:
     double current_yaw_rad_ = 0.0;
     double peak_snr_db_ = 0.0;
     double previous_yaw_error_ = 0.0;
+    double previous_depth_error_ = 0.0;
     double yaw_error_integral_ = 0.0;
     double yaw_error_derivative_ = 0.0;
     double depth_error_integral_ = 0.0;

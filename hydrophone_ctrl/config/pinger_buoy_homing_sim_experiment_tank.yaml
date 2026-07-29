@@ -1,0 +1,206 @@
+# Pinger Buoy Homing Simulation - 실험 수조 파라미터
+#
+# Region 실행:
+#   ros2 launch hydrophone_ctrl pinger_buoy_region_local_homing_sim.launch.py
+#
+# Near-zone 실행:
+#   ros2 launch hydrophone_ctrl pinger_buoy_near_zone_line_search_sim.launch.py
+#
+# 실제 실험 수조 프로파일과 제어 파라미터는 같고, 시뮬레이션 시간과
+# MuJoCo odometry 입력만 시뮬레이션용으로 설정한다.
+
+pinger_buoy_audio_sim:
+  ros__parameters:
+    use_sim_time: true
+    odometry_topic: /odometry/mujoco_raw
+
+sim_odometry_rebaser:
+  ros__parameters:
+    use_sim_time: true
+    input_topic: /odometry/mujoco_raw
+    output_topic: /odometry/filtered
+
+audio_frequency_detector:
+  ros__parameters:
+    use_sim_time: true
+
+region_local_gradient_estimator:
+  ros__parameters:
+    use_sim_time: true
+
+    # 토픽과 좌표계
+    odometry_topic: /odometry/filtered
+    start_frame_topic: /start_frame
+    snr_topic: /audio_frequency_detector/snr_db_stamped  # SNR 입력 토픽
+    state_topic: /homing/control_state
+    region_gradient_topic: /homing/region_gradient
+    rolling_gradient_topic: /homing/rolling_gradient
+    arena_frame_id: arena
+
+    # 그래디언트 추정
+    region_sample_spacing_m: 0.15  # SNR 샘플 최소 이동 간격
+    homing_gradient_window_size: 12  # 롤링 그래디언트 윈도우 크기
+    min_homing_gradient_samples: 8  # 롤링 그래디언트 피팅 최소 샘플 수
+    min_region_gradient_magnitude: 0.05  # 유효 그래디언트 최소 크기
+    min_region_lateral_spread_m: 0.10  # 유효 피팅용 최소 횡방향 퍼짐
+    odometry_timeout_s: 0.5  # odometry 타임아웃
+    max_snr_odom_skew_s: 0.15  # SNR-odometry 시각 허용 오차
+
+waypoint_homing_controller:
+  ros__parameters:
+    use_sim_time: true
+
+    # 토픽과 좌표계
+    odometry_topic: /odometry/filtered
+    start_frame_topic: /start_frame
+    state_topic: /homing/control_state
+    waypoint_topic: /homing/current_waypoint
+    scan_center_topic: /homing/scan_center
+    region_gradient_topic: /homing/region_gradient
+    rolling_gradient_topic: /homing/rolling_gradient
+    homing_direction_topic: /homing/homing_direction
+    vision_search_request_topic: /homing/vision_search_active
+    target_confirmed_topic: /vision/target_confirmed
+    vision_control_granted_topic: /homing/vision_control_granted
+    rc_override_topic: /mavros/rc/override
+    emergency_stop_topic: /mission/emergency_stop
+    arena_frame_id: arena
+
+    # 미션과 안전
+    enable_keyboard_emergency_stop: true
+    emergency_stop_key: s
+    arena_start_corner: bottom_left
+    invert_rc_yaw: true
+    vision_handoff_enabled: true
+    acoustic_timeout_s: 90.0
+    odometry_timeout_s: 0.5
+    rate_hz: 30.0
+
+    # 수조 경계
+    arena_length_m: 5.50
+    arena_width_m: 2.74
+    arena_offset_x_m: -0.30
+    arena_offset_y_m: 0.30
+    arena_safety_margin_m: 0.40
+
+    # 원형 스캔과 호밍
+    initial_scan_radius_m: 0.40
+    rescan_radius_m: 0.50
+    homing_waypoint_step_m: 0.50
+    homing_zigzag_offset_m: 0.15
+    rolling_gradient_alpha: 0.15
+    rolling_gradient_conflict_angle_rad: 1.0472
+    rolling_gradient_conflict_limit: 3
+    waypoint_reach_tolerance_m: 0.15
+    scan_radial_kp: 1.5
+    scan_radial_ki: 0.05
+    scan_radial_kd: 0.3
+    scan_radial_integral_limit: 1.0
+    vision_near_zone_width_m: 0.40
+
+    # 수심 PID
+    target_depth_z_m: -0.60
+    depth_tolerance_m: 0.15
+    depth_kp: 0.8
+    depth_ki: 0.15
+    depth_kd: 0.02
+    depth_bias: 0.1
+    heave_limit: 0.4
+
+    # 수평 RC 제어
+    forward_cruise: 0.35
+    yaw_kp: 1.15
+    yaw_ki: 0.15
+    yaw_kd: 0.08
+    yaw_integral_limit: 2.0
+    yaw_limit: 0.72
+    move_heading_tolerance_rad: 0.1745
+    vision_heading_tolerance_rad: 0.12
+    rc_pwm_span: 400.0
+
+near_zone_line_search_controller:
+  ros__parameters:
+    use_sim_time: true
+
+    # 토픽과 좌표계
+    odometry_topic: /odometry/filtered
+    start_frame_topic: /start_frame
+    snr_topic: /audio_frequency_detector/snr_db_stamped
+    state_topic: /homing/control_state
+    waypoint_topic: /homing/current_waypoint
+    peak_topic: /homing/snr_peak_position
+    vision_search_request_topic: /homing/vision_search_active
+    target_confirmed_topic: /vision/target_confirmed
+    vision_control_granted_topic: /homing/vision_control_granted
+    rc_override_topic: /mavros/rc/override
+    emergency_stop_topic: /mission/emergency_stop
+    arena_frame_id: arena
+
+    # 미션과 안전
+    enable_keyboard_emergency_stop: true
+    emergency_stop_key: s
+    arena_start_corner: bottom_right
+    invert_rc_yaw: true
+    acoustic_timeout_s: 90.0
+    odometry_timeout_s: 0.5
+    rate_hz: 30.0
+
+    # 수조 경계
+    arena_length_m: 5.50
+    arena_width_m: 2.74
+    arena_offset_x_m: -0.30
+    arena_offset_y_m: -0.30
+    arena_safety_margin_m: 0.40
+    vision_near_zone_width_m: 0.40
+
+    # Line search와 SNR peak 판정
+    line_search_direction: 1
+    line_search_start_depth_tolerance_m: 0.20
+    waypoint_reach_tolerance_m: 0.15
+    snr_sample_spacing_m: 0.15
+    snr_drop_from_peak_db: 2.0
+    snr_decline_count_limit: 5
+    snr_median_window_size: 3
+    snr_timeout_s: 1.0
+    max_snr_odom_skew_s: 0.15
+
+    # 수심 PID
+    target_depth_z_m: -0.60
+    depth_kp: 0.3
+    depth_ki: 0.05
+    depth_kd: 0.04
+    depth_bias: 0.1
+    depth_integral_limit: 2.0
+    heave_limit: 0.4
+
+    # 수평 RC 제어
+    forward_cruise: 0.35
+    yaw_kp: 1.15
+    yaw_ki: 0.15
+    yaw_kd: 0.08
+    yaw_integral_limit: 2.0
+    yaw_limit: 0.72
+    move_heading_tolerance_rad: 0.1745
+    rc_pwm_span: 400.0
+
+region_local_gradient_rviz_visualizer:
+  ros__parameters:
+    use_sim_time: true
+    odometry_topic: /odometry/filtered
+    start_frame_topic: /start_frame
+    arena_frame_id: arena
+    snr_topic: /audio_frequency_detector/snr_db_stamped
+    region_gradient_topic: /homing/region_gradient
+    rolling_gradient_topic: /homing/rolling_gradient
+    homing_direction_topic: /homing/homing_direction
+    waypoint_topic: /homing/current_waypoint
+    scan_center_topic: /homing/scan_center
+    marker_topic: /homing/rviz/markers
+    arena_length_m: 5.50
+    arena_width_m: 2.74
+    arena_offset_x_m: -0.30
+    arena_offset_y_m: 0.30
+    arena_safety_margin_m: 0.40
+    vision_near_zone_width_m: 0.40
+    arena_start_corner: bottom_left
+    map_cell_size_m: 0.15
