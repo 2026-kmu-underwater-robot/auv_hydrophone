@@ -22,7 +22,7 @@ def generate_launch_description():
         [
             FindPackageShare("hydrophone_ctrl"),
             "config",
-            "region_local_gradient_homing_competition_tank.yaml",
+            "region_local_gradient_homing_experiment_tank.yaml",
         ]
     )
 

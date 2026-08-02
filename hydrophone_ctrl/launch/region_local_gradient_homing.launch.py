@@ -15,7 +15,8 @@ def generate_launch_description():
         [
             FindPackageShare("hydrophone_ctrl"),
             "config",
-            "region_local_gradient_homing_competition_tank.yaml",
+            # "region_local_gradient_homing_competition_tank.yaml",
+            "region_local_gradient_homing_experiment_tank.yaml",
         ]
     )
 
@@ -26,7 +27,7 @@ def generate_launch_description():
     )
     launch_rviz_argument = DeclareLaunchArgument(
         "launch_rviz",
-        default_value="false",
+        default_value="true",
         description="Launch the real-robot RViz visualizer with the same YAML.",
     )
 
