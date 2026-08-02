@@ -5,6 +5,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -225,6 +227,10 @@ public:
                 rclcpp::QoS(1).reliable().transient_local());
         rc_pub_ = create_publisher<mavros_msgs::msg::OverrideRCIn>(
             rc_override_topic, 10);
+        shutdown_context_ = get_node_base_interface()->get_context();
+        pre_shutdown_callback_handle_ =
+            shutdown_context_->add_pre_shutdown_callback(
+            [this]() noexcept {publish_shutdown_neutral();});
         emergency_stop_pub_ = create_publisher<std_msgs::msg::Bool>(
             emergency_stop_topic, rclcpp::QoS(1).reliable().transient_local());
         emergency_stop_sub_ = create_subscription<std_msgs::msg::Bool>(
@@ -263,6 +269,8 @@ public:
 
     ~WaypointHomingControllerNode() override
     {
+        unregister_pre_shutdown_callback();
+        publish_shutdown_neutral();
         stop_keyboard_thread_.store(true);
         if (keyboard_thread_.joinable()) {
             keyboard_thread_.join();
@@ -552,6 +560,9 @@ private:
 
     void control_loop()
     {
+        if (shutdown_neutral_active_.load()) {
+            return;
+        }
         const rclcpp::Time current_time = now(); // 현재 시간을 가져온다.
         // [EMERGENCY NEUTRAL] 인계 상태와 무관하게 제어 채널 중립을 계속 발행한다.
         if (emergency_stop_active_.load()) {
@@ -1138,6 +1149,15 @@ private:
 
     void publish_rc(const Command & command)
     {
+        std::lock_guard<std::mutex> lock(rc_publish_mutex_);
+        if (shutdown_neutral_active_.load()) {
+            return;
+        }
+        publish_rc_unchecked(command);
+    }
+
+    void publish_rc_unchecked(const Command & command)
+    {
         mavros_msgs::msg::OverrideRCIn msg;
         msg.channels.fill(mavros_msgs::msg::OverrideRCIn::CHAN_NOCHANGE);
         // [RC OWNERSHIP] 이 제어기가 실제 사용하는 축만 override한다.
@@ -1146,6 +1166,74 @@ private:
         msg.channels[FORWARD_CHANNEL_INDEX] = axis_pwm(command.forward, false);
         msg.channels[LATERAL_CHANNEL_INDEX] = RC_NEUTRAL;
         rc_pub_->publish(msg);
+    }
+
+    void publish_shutdown_neutral() noexcept
+    {
+        {
+            std::lock_guard<std::mutex> lock(rc_publish_mutex_);
+            if (shutdown_neutral_active_.exchange(true)) {
+                return;
+            }
+            try {
+                publish_rc_unchecked(Command{});
+            } catch (const std::exception & error) {
+                RCLCPP_ERROR(
+                    get_logger(),
+                    "[SHUTDOWN] failed to publish neutral RC: %s",
+                    error.what());
+                return;
+            } catch (...) {
+                RCLCPP_ERROR(
+                    get_logger(),
+                    "[SHUTDOWN] failed to publish neutral RC: unknown error");
+                return;
+            }
+        }
+
+        try {
+            const bool acknowledged =
+                rc_pub_->wait_for_all_acked(std::chrono::milliseconds(100));
+            if (acknowledged) {
+                RCLCPP_INFO(
+                    get_logger(),
+                    "[SHUTDOWN] neutral RC published and acknowledged");
+            } else {
+                RCLCPP_WARN(
+                    get_logger(),
+                    "[SHUTDOWN] neutral RC published; acknowledgment timed out");
+            }
+        } catch (const std::exception & error) {
+            RCLCPP_WARN(
+                get_logger(),
+                "[SHUTDOWN] neutral RC published; acknowledgment check failed: %s",
+                error.what());
+        } catch (...) {
+            RCLCPP_WARN(
+                get_logger(),
+                "[SHUTDOWN] neutral RC published; acknowledgment check failed");
+        }
+    }
+
+    void unregister_pre_shutdown_callback() noexcept
+    {
+        if (!shutdown_context_ || !pre_shutdown_callback_handle_.has_value()) {
+            return;
+        }
+        try {
+            shutdown_context_->remove_pre_shutdown_callback(
+                *pre_shutdown_callback_handle_);
+        } catch (const std::exception & error) {
+            RCLCPP_WARN(
+                get_logger(),
+                "[SHUTDOWN] failed to remove pre-shutdown callback: %s",
+                error.what());
+        } catch (...) {
+            RCLCPP_WARN(
+                get_logger(),
+                "[SHUTDOWN] failed to remove pre-shutdown callback");
+        }
+        pre_shutdown_callback_handle_.reset();
     }
 
     void emergency_stop_callback(const std_msgs::msg::Bool::ConstSharedPtr msg)
@@ -1357,7 +1445,12 @@ private:
     rclcpp::Publisher<mavros_msgs::msg::OverrideRCIn>::SharedPtr rc_pub_;
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr emergency_stop_pub_;
     rclcpp::TimerBase::SharedPtr timer_;
+    rclcpp::Context::SharedPtr shutdown_context_;
+    std::optional<rclcpp::PreShutdownCallbackHandle>
+        pre_shutdown_callback_handle_;
+    std::mutex rc_publish_mutex_;
     std::atomic_bool emergency_stop_active_{false};
+    std::atomic_bool shutdown_neutral_active_{false};
     std::atomic_bool stop_keyboard_thread_{false};
     std::thread keyboard_thread_;
 };
