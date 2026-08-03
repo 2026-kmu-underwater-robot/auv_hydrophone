@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -131,6 +132,12 @@ public:
         scan_radial_integral_limit_ = std::max(
             0.0, declare_parameter<double>(
                 "scan_radial_integral_limit", 1.0));
+        scan_forward_command_ = std::clamp(
+            declare_parameter<double>("scan_forward_command", 0.30),
+            0.0, 1.0);
+        scan_yaw_feedforward_ = std::clamp(
+            declare_parameter<double>("scan_yaw_feedforward", 0.12),
+            -1.0, 1.0);
         vision_near_zone_width_m_ = std::clamp(
             declare_parameter<double>("vision_near_zone_width_m", 2.0),
             0.0, arena_width_m_);
@@ -166,6 +173,18 @@ public:
             0.05, declare_parameter<double>("odometry_timeout_s", 0.5));
         forward_cruise_ = std::clamp(
             declare_parameter<double>("forward_cruise", 0.5), 0.0, 1.0);
+        forward_slow_ = std::clamp(
+            declare_parameter<double>("forward_slow", 0.08),
+            0.0, forward_cruise_);
+        waypoint_slowdown_distance_m_ = std::max(
+            waypoint_reach_tolerance_m_,
+            declare_parameter<double>("waypoint_slowdown_distance_m", 0.25));
+        waypoint_settle_speed_mps_ = std::max(
+            0.0,
+            declare_parameter<double>("waypoint_settle_speed_mps", 0.15));
+        waypoint_settle_hold_sec_ = std::max(
+            0.0,
+            declare_parameter<double>("waypoint_settle_hold_sec", 0.3));
         yaw_kp_ = std::max(
             0.0, declare_parameter<double>("yaw_kp", 1.15));
         yaw_ki_ = std::max(
@@ -178,6 +197,9 @@ public:
             declare_parameter<double>("yaw_limit", 0.72), 0.0, 1.0);
         move_heading_tolerance_rad_ = std::clamp(
             declare_parameter<double>("move_heading_tolerance_rad", 0.1745), 0.01, PI);
+        move_heading_release_rad_ = std::clamp(
+            declare_parameter<double>("move_heading_release_rad", 0.3491),
+            move_heading_tolerance_rad_, PI);
         vision_heading_tolerance_rad_ = std::clamp(
             declare_parameter<double>("vision_heading_tolerance_rad", 0.12), 0.01, PI);
         rc_pwm_span_ = std::clamp(
@@ -382,6 +404,12 @@ private:
         current_position_ = arena_transform_.position_from_odom(odom_position);
         current_z_m_ = z_m;
         current_yaw_rad_ = arena_transform_.yaw_from_odom(odom_yaw);
+        const double velocity_x = msg->twist.twist.linear.x;
+        const double velocity_y = msg->twist.twist.linear.y;
+        current_horizontal_speed_mps_ =
+            std::isfinite(velocity_x) && std::isfinite(velocity_y) ?
+            std::hypot(velocity_x, velocity_y) :
+            std::numeric_limits<double>::infinity();
         last_odometry_receive_time_ = now(); // 마지막 오도메트리 수신 시간을 업데이트한다.
         have_odometry_ = true; // 오도메트리 수신 여부를 업데이트한다.
 
@@ -795,8 +823,19 @@ private:
         const double distance = delta.norm(); // 현재 위치와 waypoint 사이의 거리
         if (distance <= waypoint_reach_tolerance_m_) {
             publish_rc(depth_hold_command(current_time));
-            return true;
+            if (current_horizontal_speed_mps_ > waypoint_settle_speed_mps_) {
+                waypoint_settle_started_at_.reset();
+                return false;
+            }
+            if (!waypoint_settle_started_at_) {
+                waypoint_settle_started_at_ = current_time;
+                return waypoint_settle_hold_sec_ <= 0.0;
+            }
+            return
+                (current_time - *waypoint_settle_started_at_).seconds() >=
+                waypoint_settle_hold_sec_;
         }
+        waypoint_settle_started_at_.reset();
         const double desired_yaw = std::atan2(delta.y(), delta.x()); // 현재 위치와 waypoint 사이의 벡터를 이용하여 원하는 yaw 값을 계산한다.
         const double yaw_error = wrap_pi(desired_yaw - current_yaw_rad_); // 현재 yaw와 원하는 yaw 사이의 오차.
         Command command = depth_hold_command(current_time); // 수평 이동과 목표 depth 제어를 동시에 수행한다.
@@ -809,12 +848,23 @@ private:
             waypoint_heading_aligned_ = true;
         }
         if (waypoint_heading_aligned_ &&
-            std::abs(yaw_error) >= REALIGN_HEADING_ERROR_RAD)
+            std::abs(yaw_error) >= move_heading_release_rad_)
         {
             waypoint_heading_aligned_ = false;
         }
         if (waypoint_heading_aligned_) {
-            command.forward = forward_cruise_;
+            if (distance >= waypoint_slowdown_distance_m_ ||
+                waypoint_slowdown_distance_m_ <= waypoint_reach_tolerance_m_)
+            {
+                command.forward = forward_cruise_;
+            } else {
+                const double scale = std::clamp(
+                    (distance - waypoint_reach_tolerance_m_) /
+                    (waypoint_slowdown_distance_m_ - waypoint_reach_tolerance_m_),
+                    0.0, 1.0);
+                command.forward =
+                    forward_slow_ + scale * (forward_cruise_ - forward_slow_);
+            }
         }
         publish_rc(command); // 명령을 보낸다.
         return false; // 아직 도착하지 않았으므로 false를 반환.
@@ -882,13 +932,18 @@ private:
             scan_radial_kd_ * scan_radial_error_derivative_,
             -SCAN_RADIAL_CORRECTION_LIMIT,
             SCAN_RADIAL_CORRECTION_LIMIT);
+        last_scan_radial_error_ = radial_error;
+        last_scan_radial_correction_ = radial_correction;
         const Eigen::Vector2d guidance =
             tangent - radial_correction * radial_unit;
         const double desired_yaw = std::atan2(guidance.y(), guidance.x());
         const double yaw_error = wrap_pi(desired_yaw - current_yaw_rad_);
 
         Command command = depth_hold_command(current_time);
-        command.yaw = yaw_pid_command(yaw_error, current_time);
+        command.yaw = std::clamp(
+            yaw_pid_command(yaw_error, current_time) + scan_yaw_feedforward_,
+            -yaw_limit_, yaw_limit_);
+        last_yaw_command_ = command.yaw;
         if (!waypoint_heading_aligned_ &&
             std::abs(yaw_error) <= move_heading_tolerance_rad_)
         {
@@ -900,7 +955,7 @@ private:
             waypoint_heading_aligned_ = false;
         }
         if (waypoint_heading_aligned_) {
-            command.forward = forward_cruise_;
+            command.forward = scan_forward_command_;
         }
         publish_rc(command);
         return false;
@@ -1017,11 +1072,13 @@ private:
             RCLCPP_INFO_THROTTLE(
                 get_logger(), *get_clock(), 2000,
                 "[CONTROL] state=REGION_SCAN progress=%.0f/360 deg "
-                "radius=%.2f/%.2f m yaw_error=%.1f deg yaw_cmd=%.2f "
+                "radius=%.2f/%.2f m radial_error=%+.2f correction=%+.2f "
+                "yaw_error=%.1f deg yaw_cmd=%.2f "
                 "z=%.2f/%.2f m",
                 std::clamp(
                     accumulated_scan_angle_rad_ * 180.0 / PI, 0.0, 360.0),
                 radius, active_scan_radius_m_,
+                last_scan_radial_error_, last_scan_radial_correction_,
                 last_yaw_error_ * 180.0 / PI, last_yaw_command_,
                 current_z_m_, target_depth_z_m_);
             return;
@@ -1083,6 +1140,7 @@ private:
     {
         current_waypoint_ = waypoint;
         waypoint_heading_aligned_ = false;
+        waypoint_settle_started_at_.reset();
         reset_yaw_pid();
         geometry_msgs::msg::PointStamped msg;
         msg.header.stamp = now();
@@ -1357,6 +1415,8 @@ private:
     double scan_radial_ki_ = 0.05;
     double scan_radial_kd_ = 0.3;
     double scan_radial_integral_limit_ = 1.0;
+    double scan_forward_command_ = 0.30;
+    double scan_yaw_feedforward_ = 0.12;
     double vision_near_zone_width_m_ = 2.0;
     double acoustic_timeout_s_ = 90.0;
     double target_depth_z_m_ = -0.65;
@@ -1369,12 +1429,17 @@ private:
     double rate_hz_ = 30.0;
     double odometry_timeout_s_ = 0.5;
     double forward_cruise_ = 0.5;
+    double forward_slow_ = 0.08;
+    double waypoint_slowdown_distance_m_ = 0.25;
+    double waypoint_settle_speed_mps_ = 0.15;
+    double waypoint_settle_hold_sec_ = 0.3;
     double yaw_kp_ = 1.15;
     double yaw_ki_ = 0.15;
     double yaw_kd_ = 0.08;
     double yaw_integral_limit_ = 2.0;
     double yaw_limit_ = 0.72;
     double move_heading_tolerance_rad_ = 0.1745;
+    double move_heading_release_rad_ = 0.3491;
     double vision_heading_tolerance_rad_ = 0.12;
     double rc_pwm_span_ = 400.0;
     std::size_t rolling_gradient_conflict_limit_ = 3;
@@ -1405,6 +1470,8 @@ private:
     rclcpp::Time acoustic_start_time_;
     double current_yaw_rad_ = 0.0;
     double current_z_m_ = 0.0;
+    double current_horizontal_speed_mps_ =
+        std::numeric_limits<double>::infinity();
     double previous_depth_error_ = 0.0;
     double depth_error_integral_ = 0.0;
     double previous_yaw_error_ = 0.0;
@@ -1417,6 +1484,8 @@ private:
     double previous_scan_radial_error_ = 0.0;
     double scan_radial_error_integral_ = 0.0;
     double scan_radial_error_derivative_ = 0.0;
+    double last_scan_radial_error_ = 0.0;
+    double last_scan_radial_correction_ = 0.0;
     Eigen::Vector2d current_position_{0.0, 0.0};
     Eigen::Vector2d scan_center_{0.0, 0.0};
     Eigen::Vector2d current_waypoint_{0.0, 0.0};
@@ -1424,6 +1493,7 @@ private:
     Eigen::Vector2d region_gradient_{1.0, 0.0};
     Eigen::Vector2d homing_direction_{1.0, 0.0};
     std::vector<Eigen::Vector2d> waypoints_;
+    std::optional<rclcpp::Time> waypoint_settle_started_at_;
     hydrophone_ctrl::ArenaFrameTransform arena_transform_;
 
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odometry_sub_;

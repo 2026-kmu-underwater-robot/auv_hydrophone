@@ -67,8 +67,8 @@ waypoint_homing_controller:
     rate_hz: 30.0  # 제어 루프 주기
 
     # 수조 경계
-    arena_length_m: 4.0  # 수조 길이
-    arena_width_m: 2.0  # 수조 너비
+    arena_length_m: 3.0  # 수조 길이
+    arena_width_m: 1.0  # 수조 너비
     arena_offset_x_m: -0.30  # 시작 좌표계 기준 수조 경계 X 오프셋
     arena_offset_y_m: -0.30  # 시작 좌표계 기준 수조 경계 Y 오프셋
     arena_safety_margin_m: 0.40  # 벽으로부터의 안전 여유
@@ -82,9 +82,11 @@ waypoint_homing_controller:
     rolling_gradient_conflict_angle_rad: 1.0472  # 방향 충돌 판정 각도(약 60도)
     rolling_gradient_conflict_limit: 3  # 큰 방향 충돌 연속 허용 횟수
     waypoint_reach_tolerance_m: 0.15  # waypoint 도착 판정 반경
-    scan_radial_kp: 1.5  # 원형 스캔 반경 오차 P 게인
-    scan_radial_ki: 0.05  # 원형 스캔 반경 오차 I 게인
-    scan_radial_kd: 0.3  # 원형 스캔 반경 오차 D 게인
+    scan_forward_command: 0.65  # 원형 스캔 중 전진 RC 명령 크기
+    scan_yaw_feedforward: 0.20  # 원형 스캔 접선 회전을 위한 yaw 선입력
+    scan_radial_kp: 0.8  # 원형 스캔 반경 오차 P 게인
+    scan_radial_ki: 0.0  # 원형 스캔 반경 오차 I 게인
+    scan_radial_kd: 0.10  # 원형 스캔 반경 오차 D 게인
     scan_radial_integral_limit: 1.0  # 반경 오차 적분 제한
     vision_near_zone_width_m: 0.10  # 비전 인계용 근접 구간 폭
 
@@ -100,12 +102,17 @@ waypoint_homing_controller:
 
     # 수평 RC 제어
     forward_cruise: 0.35  # 정렬 후 전진 RC 명령 크기
-    yaw_kp: 1.15  # yaw 오차 비례 게인
-    yaw_ki: 0.15  # 지속 yaw 오차 제거용 적분 게인
-    yaw_kd: 0.08  # yaw 오차 변화 감쇠 게인
-    yaw_integral_limit: 2.0  # yaw 적분 누적 제한(rad*s)
+    forward_slow: 0.08  # waypoint 근처 최소 전진 RC 명령 크기
+    waypoint_slowdown_distance_m: 0.25  # waypoint 접근 감속 시작 거리
+    waypoint_settle_speed_mps: 0.15  # waypoint 도착 허용 수평 속도
+    waypoint_settle_hold_sec: 0.3  # waypoint 도착 상태 유지 시간
+    yaw_kp: 0.5  # yaw 오차 비례 게인
+    yaw_ki: 0.1  # 지속 yaw 오차 제거용 적분 게인
+    yaw_kd: 0.2  # yaw 오차 변화 감쇠 게인
+    yaw_integral_limit: 0.5  # yaw 적분 누적 제한(rad*s)
     yaw_limit: 0.72  # yaw 명령 최대 크기
     move_heading_tolerance_rad: 0.1745  # 전진 허용 헤딩 오차
+    move_heading_release_rad: 0.3491  # 전진 정렬 해제 헤딩 오차
     vision_heading_tolerance_rad: 0.12  # Vision 확인 중 전진 허용 헤딩 오차
     rc_pwm_span: 400.0  # RC 중립값 1500 기준 ±PWM 스팬
 

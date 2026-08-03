@@ -34,7 +34,7 @@ def generate_launch_description():
         [
             package_share,
             "config",
-            "pinger_buoy_homing_sim_experiment_tank.yaml",
+            "pinger_buoy_homing_sim_competition_tank.yaml",
         ]
     )
 
@@ -62,11 +62,11 @@ def generate_launch_description():
             default_value="/home/kim/new_hydrophone_ws/localization_20260719_185918",
         ),
         DeclareLaunchArgument("frequency_hz", default_value="21164.0"),
-        # 기본 pinger 좌표는 scene.xml 실험 수조 프리셋의 pinger_source와 같다.
-        DeclareLaunchArgument("pinger_x", default_value="2.20"),
-        DeclareLaunchArgument("pinger_y", default_value="-1.00"),
-        DeclareLaunchArgument("pinger_z", default_value="-0.65"),
-        DeclareLaunchArgument("source_amplitude", default_value="0.03"),
+        # 기본 pinger 좌표는 16 x 30 m 대회장 중앙의 acoustic site와 같다.
+        DeclareLaunchArgument("pinger_x", default_value="0.000"),
+        DeclareLaunchArgument("pinger_y", default_value="0.000"),
+        DeclareLaunchArgument("pinger_z", default_value="-8.645"),
+        DeclareLaunchArgument("source_amplitude", default_value="0.90"),
         DeclareLaunchArgument("clean_noise_amplitude", default_value="0.001"),
         DeclareLaunchArgument("minimum_distance_m", default_value="0.5"),
         DeclareLaunchArgument("attenuation_power", default_value="2.0"),
