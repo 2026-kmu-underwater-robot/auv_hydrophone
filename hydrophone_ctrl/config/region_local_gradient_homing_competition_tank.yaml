@@ -88,7 +88,7 @@ waypoint_homing_controller:
     scan_radial_ki: 0.0  # 원형 스캔 반경 오차 I 게인
     scan_radial_kd: 0.10  # 원형 스캔 반경 오차 D 게인
     scan_radial_integral_limit: 1.0  # 반경 오차 적분 제한
-    vision_near_zone_width_m: 2.0  # 비전 인계용 근접 구간 폭
+    vision_near_zone_width_m: 1.0  # 비전 인계용 근접 구간 폭
 
     # 수심 PID
     # depth PID 출력은 정규화 heave 명령이며 rc_pwm_span을 곱해 PWM으로 변환한다.

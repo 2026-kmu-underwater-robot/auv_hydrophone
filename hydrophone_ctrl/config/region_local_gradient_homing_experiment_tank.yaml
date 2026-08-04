@@ -110,7 +110,7 @@ waypoint_homing_controller:
     yaw_ki: 0.1  # 지속 yaw 오차 제거용 적분 게인
     yaw_kd: 0.2  # yaw 오차 변화 감쇠 게인
     yaw_integral_limit: 0.5  # yaw 적분 누적 제한(rad*s)
-    yaw_limit: 0.72  # yaw 명령 최대 크기
+    yaw_limit: 0.5  # yaw 명령 최대 크기
     move_heading_tolerance_rad: 0.1745  # 전진 허용 헤딩 오차
     move_heading_release_rad: 0.3491  # 전진 정렬 해제 헤딩 오차
     vision_heading_tolerance_rad: 0.12  # Vision 확인 중 전진 허용 헤딩 오차

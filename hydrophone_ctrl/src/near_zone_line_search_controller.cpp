@@ -7,6 +7,8 @@
 #include <deque>
 #include <functional>
 #include <iterator>
+#include <limits>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -32,8 +34,8 @@
 
 namespace audio_capture
 {
-// Vision near zone의 중앙으로 이동한 뒤 zone의 긴 축을 따라 SNR peak를 통과할
-// 때까지 주행하고, 기록한 peak 위치로 복귀해 Vision에 제어권을 넘긴다.
+// Vision near zone의 중앙으로 이동한 뒤 zone의 긴 축 끝까지 전체 SNR profile을
+// 수집하고, global maximum 지역으로 복귀해 Vision에 제어권을 넘긴다.
 class NearZoneLineSearchControllerNode : public rclcpp::Node
 {
 public:
@@ -81,6 +83,17 @@ public:
         vision_near_zone_width_m_ = std::clamp(
             declare_parameter<double>("vision_near_zone_width_m", 2.0),
             0.0, arena_width_m_);
+        line_search_end_wall_clearance_m_ = declare_parameter<double>(
+            "line_search_end_wall_clearance_m", -1.0);
+        if (!std::isfinite(line_search_end_wall_clearance_m_)) {
+            throw std::invalid_argument(
+                "line_search_end_wall_clearance_m must be finite");
+        }
+        if (line_search_end_wall_clearance_m_ >= 0.0) {
+            line_search_end_wall_clearance_m_ = std::clamp(
+                line_search_end_wall_clearance_m_,
+                arena_safety_margin_m_, arena_length_m_);
+        }
         // 0 이하면 Acoustic 타임아웃 핸드오프를 끈다.
         // line_search는 zone 안에서 동작하므로 zone 진입이 아니라 peak/timeout에서 인계한다.
         acoustic_timeout_s_ = declare_parameter<double>("acoustic_timeout_s", 90.0);
@@ -100,6 +113,8 @@ public:
         if (line_search_direction_ == 0) {
             throw std::invalid_argument("line_search_direction must be -1 or 1");
         }
+        shallow_start_clearance_m_ = std::max(
+            0.0, declare_parameter<double>("shallow_start_clearance_m", 1.5));
 
         target_depth_z_m_ = declare_parameter<double>("target_depth_z_m", -8.0);
         if (!std::isfinite(target_depth_z_m_)) {
@@ -126,12 +141,10 @@ public:
             0.01, declare_parameter<double>("waypoint_reach_tolerance_m", 0.15));
         snr_sample_spacing_m_ = std::max(
             0.01, declare_parameter<double>("snr_sample_spacing_m", 0.15));
-        snr_drop_from_peak_db_ = std::max(
-            0.0, declare_parameter<double>("snr_drop_from_peak_db", 2.0));
-        snr_decline_count_limit_ =
+        global_max_region_window_size_ =
             static_cast<std::size_t>(std::max<std::int64_t>(
                 1, declare_parameter<std::int64_t>(
-                    "snr_decline_count_limit", 5)));
+                    "global_max_region_window_size", 5)));
         snr_median_window_size_ =
             static_cast<std::size_t>(std::max<std::int64_t>(
                 1, declare_parameter<std::int64_t>(
@@ -149,6 +162,18 @@ public:
             declare_parameter<double>("rate_hz", 30.0), 1.0, 120.0);
         forward_cruise_ = std::clamp(
             declare_parameter<double>("forward_cruise", 0.5), 0.0, 1.0);
+        forward_slow_ = std::clamp(
+            declare_parameter<double>("forward_slow", 0.08),
+            0.0, forward_cruise_);
+        waypoint_slowdown_distance_m_ = std::max(
+            waypoint_reach_tolerance_m_,
+            declare_parameter<double>("waypoint_slowdown_distance_m", 0.25));
+        waypoint_settle_speed_mps_ = std::max(
+            0.0,
+            declare_parameter<double>("waypoint_settle_speed_mps", 0.15));
+        waypoint_settle_hold_sec_ = std::max(
+            0.0,
+            declare_parameter<double>("waypoint_settle_hold_sec", 0.3));
         yaw_kp_ = std::max(
             0.0, declare_parameter<double>("yaw_kp", 1.15));
         yaw_ki_ = std::max(
@@ -161,6 +186,12 @@ public:
             declare_parameter<double>("yaw_limit", 0.72), 0.0, 1.0);
         move_heading_tolerance_rad_ = std::clamp(
             declare_parameter<double>("move_heading_tolerance_rad", 0.1745),
+            0.01, PI);
+        move_heading_release_rad_ = std::clamp(
+            declare_parameter<double>("move_heading_release_rad", 0.3491),
+            move_heading_tolerance_rad_, PI);
+        vision_heading_tolerance_rad_ = std::clamp(
+            declare_parameter<double>("vision_heading_tolerance_rad", 0.12),
             0.01, PI);
         rc_pwm_span_ = std::clamp(
             declare_parameter<double>("rc_pwm_span", 400.0), 50.0, 700.0);
@@ -216,6 +247,10 @@ public:
             rclcpp::QoS(1).reliable().transient_local());
         rc_pub_ = create_publisher<mavros_msgs::msg::OverrideRCIn>(
             rc_override_topic, 10);
+        shutdown_context_ = get_node_base_interface()->get_context();
+        pre_shutdown_callback_handle_ =
+            shutdown_context_->add_pre_shutdown_callback(
+            [this]() noexcept {publish_shutdown_neutral();});
         emergency_stop_pub_ = create_publisher<std_msgs::msg::Bool>(
             emergency_stop_topic,
             rclcpp::QoS(1).reliable().transient_local());
@@ -234,17 +269,21 @@ public:
         }
         RCLCPP_INFO(
             get_logger(),
-            "Near-zone line search ready: drop=%.1f dB count=%zu spacing=%.2f m "
+            "Near-zone line search ready: global_region_window=%zu "
+            "spacing=%.2f m shallow_clearance=%.2f m "
             "acoustic_timeout_s=%.1f depth_target=%.2f PID=(%.3f, %.3f, %.3f) "
             "bias=%.3f heave_limit=%.3f "
-            "(search request in zone; peak/confirm/timeout -> grant)",
-            snr_drop_from_peak_db_, snr_decline_count_limit_,
-            snr_sample_spacing_m_, acoustic_timeout_s_, target_depth_z_m_,
+            "(full-line profile; global region/confirm/timeout -> grant)",
+            global_max_region_window_size_, snr_sample_spacing_m_,
+            shallow_start_clearance_m_,
+            acoustic_timeout_s_, target_depth_z_m_,
             depth_kp_, depth_ki_, depth_kd_, depth_bias_, heave_limit_);
     }
 
     ~NearZoneLineSearchControllerNode() override
     {
+        unregister_pre_shutdown_callback();
+        publish_shutdown_neutral();
         stop_keyboard_thread_.store(true);
         if (keyboard_thread_.joinable()) {
             keyboard_thread_.join();
@@ -258,14 +297,14 @@ private:
     static constexpr std::size_t YAW_CHANNEL_INDEX = 3;
     static constexpr std::size_t FORWARD_CHANNEL_INDEX = 4;
     static constexpr std::size_t LATERAL_CHANNEL_INDEX = 5;
+    static constexpr std::size_t SHUTDOWN_NEUTRAL_REPEAT_COUNT = 3;
     static constexpr double YAW_DERIVATIVE_ALPHA = 0.2;
-    static constexpr double REALIGN_HEADING_ERROR_RAD = PI / 3.0;
-
     enum class State
     {
+        CLEAR_SHALLOW_START,
         MOVE_TO_LINE_CENTER,
         LINE_SEARCH,
-        RETURN_TO_PEAK,
+        RETURN_TO_GLOBAL_MAX,
         HANDOFF_NEUTRAL,
         HANDOFF_COMPLETE
     };
@@ -351,6 +390,12 @@ private:
             arena_transform_.position_from_odom(odom_position);
         current_z_m_ = z_m;
         current_yaw_rad_ = arena_transform_.yaw_from_odom(odom_yaw);
+        const double velocity_x = msg->twist.twist.linear.x;
+        const double velocity_y = msg->twist.twist.linear.y;
+        current_horizontal_speed_mps_ =
+            std::isfinite(velocity_x) && std::isfinite(velocity_y) ?
+            std::hypot(velocity_x, velocity_y) :
+            std::numeric_limits<double>::infinity();
         last_odometry_receive_time_ = now();
         have_odometry_ = true;
         const rclcpp::Time stamp(msg->header.stamp);
@@ -369,13 +414,19 @@ private:
         if (first_odometry) {
             initial_z_m_ = current_z_m_;
             start_acoustic_deadline_if_needed(now());
-            line_center_ = nearest_near_zone_center(current_position_);
-            set_current_waypoint(line_center_);
+            const ArenaBounds bounds = arena_bounds(arena_safety_margin_m_);
+            shallow_clearance_waypoint_ = current_position_;
+            shallow_clearance_waypoint_.x() = std::clamp(
+                current_position_.x() + shallow_start_clearance_m_,
+                bounds.x_min, bounds.x_max);
+            set_current_waypoint(shallow_clearance_waypoint_);
             publish_state();
             RCLCPP_INFO(
                 get_logger(),
-                "[LINE] moving to near-zone center=(%.2f, %.2f), depth=%.2f m",
-                line_center_.x(), line_center_.y(), target_depth_z_m_);
+                "[SHALLOW] moving +X at start depth %.2f m: "
+                "target=(%.2f, %.2f), requested_clearance=%.2f m",
+                initial_z_m_, shallow_clearance_waypoint_.x(),
+                shallow_clearance_waypoint_.y(), shallow_start_clearance_m_);
         }
     }
 
@@ -423,32 +474,23 @@ private:
         const Eigen::Vector2d filtered_position =
             snr_filter_window_[snr_filter_window_.size() / 2].position;
 
+        snr_profile_.push_back({filtered_position, filtered_snr});
+
         if (!have_peak_ || filtered_snr > peak_snr_db_) {
             have_peak_ = true;
             peak_snr_db_ = filtered_snr;
             peak_position_ = filtered_position;
-            decline_count_ = 0;
             publish_peak_position();
             RCLCPP_INFO(
                 get_logger(),
                 "[SNR] new peak=%.1f dB position=(%.2f, %.2f)",
                 peak_snr_db_, peak_position_.x(), peak_position_.y());
-            return;
         }
 
-        if (peak_snr_db_ - filtered_snr >= snr_drop_from_peak_db_) {
-            ++decline_count_;
-        } else {
-            decline_count_ = 0;
-        }
         RCLCPP_INFO(
             get_logger(),
-            "[SNR] filtered=%.1f dB peak=%.1f dB decline=%zu/%zu",
-            filtered_snr, peak_snr_db_,
-            decline_count_, snr_decline_count_limit_);
-        if (decline_count_ >= snr_decline_count_limit_) {
-            return_to_peak_requested_ = true;
-        }
+            "[SNR] filtered=%.1f dB peak=%.1f dB profile_samples=%zu",
+            filtered_snr, peak_snr_db_, snr_profile_.size());
     }
 
     void target_confirmed_callback(
@@ -530,6 +572,9 @@ private:
 
     void control_loop()
     {
+        if (shutdown_neutral_active_.load()) {
+            return;
+        }
         const rclcpp::Time current_time = now();
         if (emergency_stop_active_.load()) {
             publish_rc(Command{});
@@ -569,6 +614,21 @@ private:
         }
 
         switch (state_) {
+            case State::CLEAR_SHALLOW_START:
+                if (follow_waypoint(current_time, initial_z_m_)) {
+                    line_center_ = nearest_near_zone_center(current_position_);
+                    depth_pid_initialized_ = false;
+                    previous_depth_error_ = 0.0;
+                    depth_error_integral_ = 0.0;
+                    transition_to(State::MOVE_TO_LINE_CENTER);
+                    set_current_waypoint(line_center_);
+                    RCLCPP_INFO(
+                        get_logger(),
+                        "[SHALLOW] clearance complete; descending toward "
+                        "near-zone center=(%.2f, %.2f), depth=%.2f m",
+                        line_center_.x(), line_center_.y(), target_depth_z_m_);
+                }
+                return;
             case State::MOVE_TO_LINE_CENTER:
                 if (follow_waypoint(current_time) &&
                     depth_ready_for_line_search())
@@ -577,25 +637,21 @@ private:
                 }
                 return;
             case State::LINE_SEARCH:
-                if (return_to_peak_requested_) {
-                    begin_return_to_peak("sustained_snr_decline");
-                    return;
-                }
                 if (!snr_is_fresh(current_time)) {
                     publish_rc(depth_hold_command(current_time));
                     return;
                 }
                 if (follow_waypoint(current_time)) {
-                    if (have_peak_) {
-                        begin_return_to_peak("line_boundary");
+                    if (select_global_max_region()) {
+                        begin_return_to_global_max();
                     } else {
                         begin_vision_handoff("line_boundary");
                     }
                 }
                 return;
-            case State::RETURN_TO_PEAK:
+            case State::RETURN_TO_GLOBAL_MAX:
                 if (follow_waypoint(current_time)) {
-                    begin_vision_handoff("snr_peak");
+                    begin_vision_handoff("global_max_region");
                 }
                 return;
             case State::HANDOFF_NEUTRAL:
@@ -608,14 +664,22 @@ private:
     {
         const ArenaBounds bounds = arena_bounds(arena_safety_margin_m_);
         line_endpoint_ = line_center_;
-        line_endpoint_.x() =
-            line_search_direction_ > 0 ? bounds.x_max : bounds.x_min;
+        if (line_search_end_wall_clearance_m_ >= 0.0) {
+            const ArenaBounds physical_bounds = arena_bounds(0.0);
+            const double requested_x = line_search_direction_ > 0 ?
+                physical_bounds.x_max - line_search_end_wall_clearance_m_ :
+                physical_bounds.x_min + line_search_end_wall_clearance_m_;
+            line_endpoint_.x() = std::clamp(
+                requested_x, bounds.x_min, bounds.x_max);
+        } else {
+            line_endpoint_.x() =
+                line_search_direction_ > 0 ? bounds.x_max : bounds.x_min;
+        }
         have_snr_ = false;
         have_peak_ = false;
-        return_to_peak_requested_ = false;
-        decline_count_ = 0;
         last_sample_position_.reset();
         snr_filter_window_.clear();
+        snr_profile_.clear();
         request_vision_confirmation();
         transition_to(State::LINE_SEARCH);
         set_current_waypoint(line_endpoint_);
@@ -626,7 +690,7 @@ private:
             line_endpoint_.x(), line_endpoint_.y());
     }
 
-    void begin_return_to_peak(const char * reason)
+    void begin_return_to_global_max()
     {
         if (!have_peak_) {
             publish_rc(depth_hold_command(now()));
@@ -634,46 +698,141 @@ private:
                 get_logger(), "[LINE] cannot return: no valid SNR peak");
             return;
         }
-        return_to_peak_requested_ = false;
-        transition_to(State::RETURN_TO_PEAK);
+        transition_to(State::RETURN_TO_GLOBAL_MAX);
         set_current_waypoint(peak_position_);
         RCLCPP_INFO(
             get_logger(),
-            "[LINE] return reason=%s peak=%.1f dB position=(%.2f, %.2f)",
-            reason, peak_snr_db_, peak_position_.x(), peak_position_.y());
+            "[LINE] returning to global max region: peak=%.1f dB "
+            "target=(%.2f, %.2f)",
+            peak_snr_db_, peak_position_.x(), peak_position_.y());
     }
 
-    bool follow_waypoint(const rclcpp::Time & current_time)
+    bool follow_waypoint(
+        const rclcpp::Time & current_time, const double depth_target_z_m)
     {
         const Eigen::Vector2d delta = current_waypoint_ - current_position_;
-        if (delta.norm() <= waypoint_reach_tolerance_m_) {
-            publish_rc(depth_hold_command(current_time));
-            return true;
+        const double distance = delta.norm();
+        if (distance <= waypoint_reach_tolerance_m_) {
+            publish_rc(depth_hold_command_for_target(
+                current_time, depth_target_z_m));
+            if (current_horizontal_speed_mps_ > waypoint_settle_speed_mps_) {
+                waypoint_settle_started_at_.reset();
+                return false;
+            }
+            if (!waypoint_settle_started_at_) {
+                waypoint_settle_started_at_ = current_time;
+                return waypoint_settle_hold_sec_ <= 0.0;
+            }
+            return
+                (current_time - *waypoint_settle_started_at_).seconds() >=
+                waypoint_settle_hold_sec_;
         }
+        waypoint_settle_started_at_.reset();
         const double desired_yaw = std::atan2(delta.y(), delta.x());
         const double yaw_error = wrap_pi(desired_yaw - current_yaw_rad_);
-        Command command = depth_hold_command(current_time);
+        Command command = depth_hold_command_for_target(
+            current_time, depth_target_z_m);
         command.yaw = yaw_pid_command(yaw_error, current_time);
+        const double heading_tolerance = vision_search_requested_ ?
+            vision_heading_tolerance_rad_ : move_heading_tolerance_rad_;
         if (!heading_aligned_ &&
-            std::abs(yaw_error) <= move_heading_tolerance_rad_)
+            std::abs(yaw_error) <= heading_tolerance)
         {
             heading_aligned_ = true;
         }
         if (heading_aligned_ &&
-            std::abs(yaw_error) >= REALIGN_HEADING_ERROR_RAD)
+            std::abs(yaw_error) >= move_heading_release_rad_)
         {
             heading_aligned_ = false;
         }
         if (heading_aligned_) {
-            command.forward = forward_cruise_;
+            if (distance >= waypoint_slowdown_distance_m_ ||
+                waypoint_slowdown_distance_m_ <= waypoint_reach_tolerance_m_)
+            {
+                command.forward = forward_cruise_;
+            } else {
+                const double scale = std::clamp(
+                    (distance - waypoint_reach_tolerance_m_) /
+                    (waypoint_slowdown_distance_m_ - waypoint_reach_tolerance_m_),
+                    0.0, 1.0);
+                command.forward =
+                    forward_slow_ + scale * (forward_cruise_ - forward_slow_);
+            }
         }
         publish_rc(command);
         return false;
     }
 
+    bool follow_waypoint(const rclcpp::Time & current_time)
+    {
+        return follow_waypoint(current_time, target_depth_z_m_);
+    }
+
+    bool select_global_max_region()
+    {
+        if (snr_profile_.empty()) {
+            return false;
+        }
+
+        const std::size_t window_size = std::min(
+            global_max_region_window_size_, snr_profile_.size());
+        std::size_t best_start = 0;
+        double rolling_sum = 0.0;
+        for (std::size_t i = 0; i < window_size; ++i) {
+            rolling_sum += snr_profile_[i].snr_db;
+        }
+        double best_average = rolling_sum / static_cast<double>(window_size);
+        for (std::size_t start = 1;
+            start + window_size <= snr_profile_.size(); ++start)
+        {
+            rolling_sum -= snr_profile_[start - 1].snr_db;
+            rolling_sum += snr_profile_[start + window_size - 1].snr_db;
+            const double average =
+                rolling_sum / static_cast<double>(window_size);
+            if (average > best_average) {
+                best_average = average;
+                best_start = start;
+            }
+        }
+
+        double region_peak_snr = -std::numeric_limits<double>::infinity();
+        for (std::size_t i = best_start; i < best_start + window_size; ++i) {
+            region_peak_snr = std::max(region_peak_snr, snr_profile_[i].snr_db);
+        }
+
+        Eigen::Vector2d weighted_position(0.0, 0.0);
+        double total_weight = 0.0;
+        for (std::size_t i = best_start; i < best_start + window_size; ++i) {
+            const double weight = std::pow(
+                10.0, (snr_profile_[i].snr_db - region_peak_snr) / 10.0);
+            weighted_position += weight * snr_profile_[i].position;
+            total_weight += weight;
+        }
+        if (total_weight <= 0.0 || !std::isfinite(total_weight)) {
+            return false;
+        }
+
+        peak_position_ = weighted_position / total_weight;
+        peak_snr_db_ = region_peak_snr;
+        publish_peak_position();
+        RCLCPP_INFO(
+            get_logger(),
+            "[SNR] global max region selected: samples=%zu-%zu/%zu "
+            "average=%.1f dB peak=%.1f dB target=(%.2f, %.2f)",
+            best_start, best_start + window_size - 1, snr_profile_.size(),
+            best_average, peak_snr_db_, peak_position_.x(), peak_position_.y());
+        return true;
+    }
+
     Command depth_hold_command(const rclcpp::Time & current_time)
     {
-        const double error = target_depth_z_m_ - current_z_m_;
+        return depth_hold_command_for_target(current_time, target_depth_z_m_);
+    }
+
+    Command depth_hold_command_for_target(
+        const rclcpp::Time & current_time, const double depth_target_z_m)
+    {
+        const double error = depth_target_z_m - current_z_m_;
         double dt = 0.0;
         double error_derivative = 0.0;
         if (depth_pid_initialized_) {
@@ -747,13 +906,18 @@ private:
     void reset_motion_controllers()
     {
         heading_aligned_ = false;
-        yaw_pid_initialized_ = false;
+        reset_yaw_pid();
         depth_pid_initialized_ = false;
-        previous_yaw_error_ = 0.0;
         previous_depth_error_ = 0.0;
+        depth_error_integral_ = 0.0;
+    }
+
+    void reset_yaw_pid()
+    {
+        yaw_pid_initialized_ = false;
+        previous_yaw_error_ = 0.0;
         yaw_error_integral_ = 0.0;
         yaw_error_derivative_ = 0.0;
-        depth_error_integral_ = 0.0;
     }
 
     ArenaBounds arena_bounds(const double inset) const
@@ -869,7 +1033,8 @@ private:
     {
         current_waypoint_ = waypoint;
         heading_aligned_ = false;
-        yaw_pid_initialized_ = false;
+        waypoint_settle_started_at_.reset();
+        reset_yaw_pid();
         geometry_msgs::msg::PointStamped msg;
         msg.header.stamp = now();
         msg.header.frame_id = arena_frame_id_;
@@ -924,6 +1089,15 @@ private:
 
     void publish_rc(const Command & command)
     {
+        std::lock_guard<std::mutex> lock(rc_publish_mutex_);
+        if (shutdown_neutral_active_.load()) {
+            return;
+        }
+        publish_rc_unchecked(command);
+    }
+
+    void publish_rc_unchecked(const Command & command)
+    {
         mavros_msgs::msg::OverrideRCIn msg;
         msg.channels.fill(mavros_msgs::msg::OverrideRCIn::CHAN_NOCHANGE);
         msg.channels[VERTICAL_CHANNEL_INDEX] = axis_pwm(command.heave, true);
@@ -931,6 +1105,85 @@ private:
         msg.channels[FORWARD_CHANNEL_INDEX] = axis_pwm(command.forward, false);
         msg.channels[LATERAL_CHANNEL_INDEX] = RC_NEUTRAL;
         rc_pub_->publish(msg);
+    }
+
+    void publish_shutdown_neutral() noexcept
+    {
+        {
+            std::lock_guard<std::mutex> lock(rc_publish_mutex_);
+            if (shutdown_neutral_active_.exchange(true)) {
+                return;
+            }
+            try {
+                for (std::size_t index = 0;
+                    index < SHUTDOWN_NEUTRAL_REPEAT_COUNT; ++index)
+                {
+                    publish_rc_unchecked(Command{});
+                    if (index + 1 < SHUTDOWN_NEUTRAL_REPEAT_COUNT) {
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(20));
+                    }
+                }
+            } catch (const std::exception & error) {
+                RCLCPP_ERROR(
+                    get_logger(),
+                    "[SHUTDOWN] failed to publish neutral RC: %s",
+                    error.what());
+                return;
+            } catch (...) {
+                RCLCPP_ERROR(
+                    get_logger(),
+                    "[SHUTDOWN] failed to publish neutral RC: unknown error");
+                return;
+            }
+        }
+
+        try {
+            const bool acknowledged =
+                rc_pub_->wait_for_all_acked(std::chrono::milliseconds(100));
+            if (acknowledged) {
+                RCLCPP_INFO(
+                    get_logger(),
+                    "[SHUTDOWN] %zu neutral RC messages published and acknowledged",
+                    SHUTDOWN_NEUTRAL_REPEAT_COUNT);
+            } else {
+                RCLCPP_WARN(
+                    get_logger(),
+                    "[SHUTDOWN] %zu neutral RC messages published; "
+                    "acknowledgment timed out",
+                    SHUTDOWN_NEUTRAL_REPEAT_COUNT);
+            }
+        } catch (const std::exception & error) {
+            RCLCPP_WARN(
+                get_logger(),
+                "[SHUTDOWN] neutral RC published; acknowledgment check failed: %s",
+                error.what());
+        } catch (...) {
+            RCLCPP_WARN(
+                get_logger(),
+                "[SHUTDOWN] neutral RC published; acknowledgment check failed");
+        }
+    }
+
+    void unregister_pre_shutdown_callback() noexcept
+    {
+        if (!shutdown_context_ || !pre_shutdown_callback_handle_.has_value()) {
+            return;
+        }
+        try {
+            shutdown_context_->remove_pre_shutdown_callback(
+                *pre_shutdown_callback_handle_);
+        } catch (const std::exception & error) {
+            RCLCPP_WARN(
+                get_logger(),
+                "[SHUTDOWN] failed to remove pre-shutdown callback: %s",
+                error.what());
+        } catch (...) {
+            RCLCPP_WARN(
+                get_logger(),
+                "[SHUTDOWN] failed to remove pre-shutdown callback");
+        }
+        pre_shutdown_callback_handle_.reset();
     }
 
     void trigger_emergency_stop()
@@ -1006,9 +1259,10 @@ private:
     static const char * state_name(const State state)
     {
         switch (state) {
+            case State::CLEAR_SHALLOW_START: return "CLEAR_SHALLOW_START";
             case State::MOVE_TO_LINE_CENTER: return "MOVE_TO_LINE_CENTER";
             case State::LINE_SEARCH: return "LINE_SEARCH";
-            case State::RETURN_TO_PEAK: return "RETURN_TO_PEAK";
+            case State::RETURN_TO_GLOBAL_MAX: return "RETURN_TO_GLOBAL_MAX";
             case State::HANDOFF_NEUTRAL: return "HANDOFF_NEUTRAL";
             case State::HANDOFF_COMPLETE: return "HANDOFF_COMPLETE";
         }
@@ -1021,6 +1275,8 @@ private:
     double arena_offset_y_m_ = 0.0;
     double arena_safety_margin_m_ = 0.5;
     double vision_near_zone_width_m_ = 2.0;
+    double line_search_end_wall_clearance_m_ = -1.0;
+    double shallow_start_clearance_m_ = 1.5;
     double acoustic_timeout_s_ = 90.0;
     double target_depth_z_m_ = -8.0;
     double line_search_start_depth_tolerance_m_ = 0.2;
@@ -1032,32 +1288,35 @@ private:
     double heave_limit_ = 0.2;
     double waypoint_reach_tolerance_m_ = 0.15;
     double snr_sample_spacing_m_ = 0.15;
-    double snr_drop_from_peak_db_ = 2.0;
     double snr_timeout_s_ = 1.0;
     double max_snr_odom_skew_s_ = 0.15;
     double odometry_timeout_s_ = 0.5;
     double rate_hz_ = 30.0;
     double forward_cruise_ = 0.5;
+    double forward_slow_ = 0.08;
+    double waypoint_slowdown_distance_m_ = 0.25;
+    double waypoint_settle_speed_mps_ = 0.15;
+    double waypoint_settle_hold_sec_ = 0.3;
     double yaw_kp_ = 1.15;
     double yaw_ki_ = 0.15;
     double yaw_kd_ = 0.08;
     double yaw_integral_limit_ = 2.0;
     double yaw_limit_ = 0.72;
     double move_heading_tolerance_rad_ = 0.1745;
+    double move_heading_release_rad_ = 0.3491;
+    double vision_heading_tolerance_rad_ = 0.12;
     double rc_pwm_span_ = 400.0;
-    std::size_t snr_decline_count_limit_ = 5;
+    std::size_t global_max_region_window_size_ = 5;
     std::size_t snr_median_window_size_ = 3;
-    std::size_t decline_count_ = 0;
     int line_search_direction_ = 1;
     std::string arena_start_corner_ = "bottom_left";
     std::string emergency_stop_key_ = "s";
     std::string arena_frame_id_ = "arena";
-    State state_ = State::MOVE_TO_LINE_CENTER;
+    State state_ = State::CLEAR_SHALLOW_START;
     bool have_odometry_ = false;
     bool have_snr_ = false;
     bool have_peak_ = false;
     bool heading_aligned_ = false;
-    bool return_to_peak_requested_ = false;
     bool vision_search_requested_ = false;
     bool handoff_neutral_sent_ = false;
     bool acoustic_deadline_started_ = false;
@@ -1073,6 +1332,8 @@ private:
     double current_z_m_ = 0.0;
     double initial_z_m_ = 0.0;
     double current_yaw_rad_ = 0.0;
+    double current_horizontal_speed_mps_ =
+        std::numeric_limits<double>::infinity();
     double peak_snr_db_ = 0.0;
     double previous_yaw_error_ = 0.0;
     double previous_depth_error_ = 0.0;
@@ -1081,11 +1342,14 @@ private:
     double depth_error_integral_ = 0.0;
     Eigen::Vector2d current_position_{0.0, 0.0};
     Eigen::Vector2d current_waypoint_{0.0, 0.0};
+    Eigen::Vector2d shallow_clearance_waypoint_{0.0, 0.0};
     Eigen::Vector2d line_center_{0.0, 0.0};
     Eigen::Vector2d line_endpoint_{0.0, 0.0};
     Eigen::Vector2d peak_position_{0.0, 0.0};
     std::optional<Eigen::Vector2d> last_sample_position_;
+    std::optional<rclcpp::Time> waypoint_settle_started_at_;
     std::deque<SnrSample> snr_filter_window_;
+    std::deque<SnrSample> snr_profile_;
     std::deque<PoseSample> odometry_history_;
     hydrophone_ctrl::ArenaFrameTransform arena_transform_;
     std::atomic_bool emergency_stop_active_{false};
@@ -1108,6 +1372,11 @@ private:
     rclcpp::Publisher<mavros_msgs::msg::OverrideRCIn>::SharedPtr rc_pub_;
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr emergency_stop_pub_;
     rclcpp::TimerBase::SharedPtr timer_;
+    rclcpp::Context::SharedPtr shutdown_context_;
+    std::optional<rclcpp::PreShutdownCallbackHandle>
+        pre_shutdown_callback_handle_;
+    std::mutex rc_publish_mutex_;
+    std::atomic_bool shutdown_neutral_active_{false};
 };
 }  // namespace audio_capture
 

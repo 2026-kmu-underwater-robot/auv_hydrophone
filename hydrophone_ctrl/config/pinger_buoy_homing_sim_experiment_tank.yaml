@@ -142,6 +142,7 @@ near_zone_line_search_controller:
     arena_start_corner: bottom_right
     invert_rc_yaw: true
     acoustic_timeout_s: 90.0
+    shallow_start_clearance_m: 1.5
     odometry_timeout_s: 0.5
     rate_hz: 30.0
 
@@ -149,7 +150,7 @@ near_zone_line_search_controller:
     arena_length_m: 5.50
     arena_width_m: 2.74
     arena_offset_x_m: -0.30
-    arena_offset_y_m: -0.30
+    arena_offset_y_m: 0.30
     arena_safety_margin_m: 0.40
     vision_near_zone_width_m: 0.40
 
@@ -158,29 +159,34 @@ near_zone_line_search_controller:
     line_search_start_depth_tolerance_m: 0.20
     waypoint_reach_tolerance_m: 0.15
     snr_sample_spacing_m: 0.15
-    snr_drop_from_peak_db: 2.0
-    snr_decline_count_limit: 5
+    global_max_region_window_size: 5
     snr_median_window_size: 3
     snr_timeout_s: 1.0
     max_snr_odom_skew_s: 0.15
 
     # 수심 PID
     target_depth_z_m: -0.60
-    depth_kp: 0.3
-    depth_ki: 0.05
-    depth_kd: 0.04
+    depth_kp: 0.8
+    depth_ki: 0.15
+    depth_kd: 0.02
     depth_bias: 0.1
     depth_integral_limit: 2.0
     heave_limit: 0.4
 
     # 수평 RC 제어
     forward_cruise: 0.35
-    yaw_kp: 1.15
-    yaw_ki: 0.15
-    yaw_kd: 0.08
-    yaw_integral_limit: 2.0
+    forward_slow: 0.08
+    waypoint_slowdown_distance_m: 0.25
+    waypoint_settle_speed_mps: 0.15
+    waypoint_settle_hold_sec: 0.3
+    yaw_kp: 0.5
+    yaw_ki: 0.1
+    yaw_kd: 0.2
+    yaw_integral_limit: 0.5
     yaw_limit: 0.72
     move_heading_tolerance_rad: 0.1745
+    move_heading_release_rad: 0.3491
+    vision_heading_tolerance_rad: 0.12
     rc_pwm_span: 400.0
 
 region_local_gradient_rviz_visualizer:

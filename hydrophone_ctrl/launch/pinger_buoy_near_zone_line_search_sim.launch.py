@@ -15,7 +15,7 @@ def generate_launch_description():
         [
             package_share,
             "config",
-            "pinger_buoy_homing_sim_experiment_tank.yaml",
+            "pinger_buoy_homing_sim_competition_tank.yaml",
         ]
     )
 

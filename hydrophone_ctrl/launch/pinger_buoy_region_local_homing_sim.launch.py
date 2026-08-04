@@ -54,7 +54,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "signal_mode",
-            default_value="noisy",
+            default_value="clean",
             description="clean 또는 실측 배경 잡음이 섞인 noisy.",
         ),
         DeclareLaunchArgument(
@@ -66,7 +66,7 @@ def generate_launch_description():
         DeclareLaunchArgument("pinger_x", default_value="0.000"),
         DeclareLaunchArgument("pinger_y", default_value="0.000"),
         DeclareLaunchArgument("pinger_z", default_value="-8.645"),
-        DeclareLaunchArgument("source_amplitude", default_value="0.90"),
+        DeclareLaunchArgument("source_amplitude", default_value="0.30"),
         DeclareLaunchArgument("clean_noise_amplitude", default_value="0.001"),
         DeclareLaunchArgument("minimum_distance_m", default_value="0.5"),
         DeclareLaunchArgument("attenuation_power", default_value="2.0"),
