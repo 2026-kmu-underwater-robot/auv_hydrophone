@@ -162,12 +162,14 @@ near_zone_line_search_controller:
     arena_offset_y_m: 0.55
     arena_safety_margin_m: 0.5
     vision_near_zone_width_m: 0.5
+    near_zone_entry_wall_clearance_m: 1.5
 
     # Line search와 SNR peak 판정
     line_search_direction: 1
-    line_search_end_wall_clearance_m: 1.0
+    line_search_end_wall_clearance_m: 1.5
     line_search_start_depth_tolerance_m: 0.20
     waypoint_reach_tolerance_m: 0.15
+    vision_confirmation_distance_m: 1.0
     snr_sample_spacing_m: 0.15
     global_max_region_window_size: 5
     snr_median_window_size: 3
@@ -193,7 +195,7 @@ near_zone_line_search_controller:
     yaw_ki: 0.1
     yaw_kd: 0.2
     yaw_integral_limit: 0.5
-    yaw_limit: 0.72
+    yaw_limit: 0.50
     move_heading_tolerance_rad: 0.1745
     move_heading_release_rad: 0.3491
     vision_heading_tolerance_rad: 0.12

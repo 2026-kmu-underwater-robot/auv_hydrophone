@@ -83,6 +83,17 @@ public:
         vision_near_zone_width_m_ = std::clamp(
             declare_parameter<double>("vision_near_zone_width_m", 2.0),
             0.0, arena_width_m_);
+        near_zone_entry_wall_clearance_m_ = declare_parameter<double>(
+            "near_zone_entry_wall_clearance_m", -1.0);
+        if (!std::isfinite(near_zone_entry_wall_clearance_m_)) {
+            throw std::invalid_argument(
+                "near_zone_entry_wall_clearance_m must be finite");
+        }
+        if (near_zone_entry_wall_clearance_m_ >= 0.0) {
+            near_zone_entry_wall_clearance_m_ = std::clamp(
+                near_zone_entry_wall_clearance_m_,
+                arena_safety_margin_m_, arena_length_m_);
+        }
         line_search_end_wall_clearance_m_ = declare_parameter<double>(
             "line_search_end_wall_clearance_m", -1.0);
         if (!std::isfinite(line_search_end_wall_clearance_m_)) {
@@ -139,6 +150,9 @@ public:
             declare_parameter<double>("heave_limit", 0.2), 0.0, 1.0);
         waypoint_reach_tolerance_m_ = std::max(
             0.01, declare_parameter<double>("waypoint_reach_tolerance_m", 0.15));
+        vision_confirmation_distance_m_ = std::max(
+            waypoint_reach_tolerance_m_,
+            declare_parameter<double>("vision_confirmation_distance_m", 1.0));
         snr_sample_spacing_m_ = std::max(
             0.01, declare_parameter<double>("snr_sample_spacing_m", 0.15));
         global_max_region_window_size_ =
@@ -496,7 +510,9 @@ private:
     void target_confirmed_callback(
         const std_msgs::msg::Bool::ConstSharedPtr msg)
     {
-        if (!msg->data || !vision_search_requested_ || handoff_in_progress()) {
+        if (!msg->data || state_ != State::RETURN_TO_GLOBAL_MAX ||
+            !vision_search_requested_ || handoff_in_progress())
+        {
             return;
         }
         begin_vision_handoff("target_confirmed");
@@ -528,7 +544,8 @@ private:
             (current_time - acoustic_start_time_).seconds() >= acoustic_timeout_s_;
     }
 
-    // line-search는 이미 near zone에서 동작하므로 탐색 요청만 먼저 보낸다.
+    // Global maximum waypoint의 설정 거리 근방에서 Acoustic 제어를 유지한 채
+    // Vision에 표적 확인을 요청한다.
     void request_vision_confirmation()
     {
         if (vision_search_requested_ || handoff_in_progress()) {
@@ -650,8 +667,21 @@ private:
                 }
                 return;
             case State::RETURN_TO_GLOBAL_MAX:
+                if (!vision_search_requested_ &&
+                    (current_waypoint_ - current_position_).norm() <=
+                    vision_confirmation_distance_m_)
+                {
+                    request_vision_confirmation();
+                }
                 if (follow_waypoint(current_time)) {
-                    begin_vision_handoff("global_max_region");
+                    if (!vision_search_requested_) {
+                        request_vision_confirmation();
+                    }
+                    publish_rc(depth_hold_command(current_time));
+                    RCLCPP_INFO_THROTTLE(
+                        get_logger(), *get_clock(), 2000,
+                        "[VISION] holding global maximum waypoint while "
+                        "waiting for target confirmation");
                 }
                 return;
             case State::HANDOFF_NEUTRAL:
@@ -680,7 +710,6 @@ private:
         last_sample_position_.reset();
         snr_filter_window_.clear();
         snr_profile_.clear();
-        request_vision_confirmation();
         transition_to(State::LINE_SEARCH);
         set_current_waypoint(line_endpoint_);
         RCLCPP_INFO(
@@ -939,12 +968,20 @@ private:
         const Eigen::Vector2d & position) const
     {
         const ArenaBounds bounds = arena_bounds(arena_safety_margin_m_);
+        double x = std::clamp(position.x(), bounds.x_min, bounds.x_max);
+        if (near_zone_entry_wall_clearance_m_ >= 0.0) {
+            const ArenaBounds physical_bounds = arena_bounds(0.0);
+            const double requested_x = line_search_direction_ > 0 ?
+                physical_bounds.x_min + near_zone_entry_wall_clearance_m_ :
+                physical_bounds.x_max - near_zone_entry_wall_clearance_m_;
+            x = std::clamp(requested_x, bounds.x_min, bounds.x_max);
+        }
         const double width = std::min(
             vision_near_zone_width_m_, bounds.y_max - bounds.y_min);
         const double y = arena_start_corner_ == "bottom_left" ?
             bounds.y_min + 0.5 * width :
             bounds.y_max - 0.5 * width;
-        return {std::clamp(position.x(), bounds.x_min, bounds.x_max), y};
+        return {x, y};
     }
 
     bool odometry_is_fresh(const rclcpp::Time & current_time) const
@@ -1275,6 +1312,7 @@ private:
     double arena_offset_y_m_ = 0.0;
     double arena_safety_margin_m_ = 0.5;
     double vision_near_zone_width_m_ = 2.0;
+    double near_zone_entry_wall_clearance_m_ = -1.0;
     double line_search_end_wall_clearance_m_ = -1.0;
     double shallow_start_clearance_m_ = 1.5;
     double acoustic_timeout_s_ = 90.0;
@@ -1287,6 +1325,7 @@ private:
     double depth_integral_limit_ = 2.0;
     double heave_limit_ = 0.2;
     double waypoint_reach_tolerance_m_ = 0.15;
+    double vision_confirmation_distance_m_ = 1.0;
     double snr_sample_spacing_m_ = 0.15;
     double snr_timeout_s_ = 1.0;
     double max_snr_odom_skew_s_ = 0.15;
