@@ -1,0 +1,77 @@
+haredcoded_pwm_node:
+  ros__parameters:
+    # RC channels: yaw=channel 4, forward=channel 5.
+    first_forward_pwm: 1680
+    first_forward_duration_sec: 5.0
+    yaw_pwm: 1680
+    yaw_duration_sec: 7.0
+    second_forward_pwm: 1680
+    second_forward_duration_sec: 75.0
+
+    clockwise_yaw_pwm: 1320
+    clockwise_yaw_duration_sec: 5.0
+    snr_forward_pwm: 1680
+    snr_forward_duration_sec: 44.0
+    uturn_yaw_pwm: 1680
+    uturn_yaw_duration_sec: 5.0
+    return_forward_pwm: 1680
+
+    # Near-zone controller와 동일한 odometry 기반 수심 PID.
+    odometry_topic: /odometry/filtered
+    target_depth_z_m: -8.65
+    depth_kp: 0.8
+    depth_ki: 0.15
+    depth_kd: 0.02
+    depth_bias: 0.1
+    depth_integral_limit: 2.0
+    heave_limit: 0.4
+    rc_pwm_span: 400.0
+
+    snr_sample_period_sec: 0.1
+    snr_median_window_size: 3
+    global_max_region_window_size: 5
+    vision_confirmation_lead_sec: 1.0
+
+    snr_topic: /audio_frequency_detector/snr_db_stamped
+    vision_search_request_topic: /homing/vision_search_active
+    target_confirmed_topic: /vision/target_confirmed
+    vision_control_granted_topic: /homing/vision_control_granted
+    timeout_topic: /homing/timeout
+    state_topic: /homing/haredcoded_pwm_state
+    raw_snr_map_topic: /homing/snr_raw_time_map
+    filtered_snr_map_topic: /homing/snr_filtered_time_map
+    selected_snr_target_topic: /homing/snr_selected_time_target
+
+haredcoded_pwm_visualizer:
+  ros__parameters:
+    frame_id: map
+    time_scale_m_per_sec: 0.4
+    snr_scale_m_per_db: 0.05
+    origin_x: 0.0
+    origin_y: 0.0
+    origin_z: 0.2
+
+pinger_buoy_audio_sim:
+  ros__parameters:
+    use_sim_time: false
+    odometry_topic: /sim/odom
+    signal_mode: clean
+    frequency_hz: 21164.0
+    pinger_x: 0.0
+    pinger_y: 0.0
+    pinger_z: -8.645
+    source_amplitude: 0.30
+    clean_noise_amplitude: 0.001
+    minimum_distance_m: 0.5
+    attenuation_power: 2.0
+    sound_speed_mps: 1500.0
+
+sim_odometry_rebaser:
+  ros__parameters:
+    use_sim_time: false
+    input_topic: /sim/odom
+    output_topic: /odometry/filtered
+
+audio_frequency_detector:
+  ros__parameters:
+    use_sim_time: false

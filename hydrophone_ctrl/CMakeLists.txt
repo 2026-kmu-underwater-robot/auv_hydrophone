@@ -64,6 +64,28 @@ rclcpp_components_register_node(
   EXECUTABLE start_frame_publisher
 )
 
+add_executable(haredcoded_pwm_node
+  src/haredcoded_pwm_node.cpp
+)
+ament_target_dependencies(haredcoded_pwm_node
+  audio_common_msgs
+  geometry_msgs
+  mavros_msgs
+  nav_msgs
+  rclcpp
+  std_msgs
+)
+
+add_executable(haredcoded_pwm_visualizer
+  src/haredcoded_pwm_visualizer.cpp
+)
+ament_target_dependencies(haredcoded_pwm_visualizer
+  geometry_msgs
+  rclcpp
+  std_msgs
+  visualization_msgs
+)
+
 install(
   TARGETS
     ${PROJECT_NAME}
@@ -72,6 +94,8 @@ install(
     near_zone_line_search_controller
     region_local_gradient_rviz_visualizer
     start_frame_publisher
+    haredcoded_pwm_node
+    haredcoded_pwm_visualizer
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION lib/${PROJECT_NAME}
